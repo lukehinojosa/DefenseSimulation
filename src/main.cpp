@@ -11,9 +11,18 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <string>
 
 #include "sim/EngagementManager.hpp"
 #include "sim/SimulationEngine.hpp"
+
+#if defined(__linux__)
+#include <thread>
+#include <vector>
+#include "sim/SharedMemoryChannel.hpp"
+#include "sim/Telemetry.hpp"
+#define SIM_HAVE_TELEMETRY 1
+#endif
 
 namespace {
 
@@ -134,13 +143,109 @@ void runEngagementDemo() {
               << "\n";
 }
 
+#if defined(SIM_HAVE_TELEMETRY)
+// Real-time engagement scenario that publishes a telemetry frame every tick to
+// POSIX shared memory for the separate telemetry_monitor process to consume.
+void runTelemetryPublisher(double durationSec) {
+    namespace tlm = sim::telemetry;
+    const double dt = 1.0 / 60.0;
+
+    sim::SimulationEngine engine(sim::defaultAirspace());
+    sim::EngagementManager::Config cfg;
+    cfg.defendedAsset = {50000.0, 50000.0, 0.0};
+    cfg.fuzeRadius    = 15.0;
+    sim::EngagementManager mgr(engine, cfg);
+
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<double> jitter(-8000.0, 8000.0);
+    for (int i = 0; i < 24; ++i) {
+        Entity h;
+        // Closer, faster inbound salvo so intercepts resolve within the demo
+        // window (and the intercept counter is visibly exercised in the feed).
+        h.position = {64000.0 + jitter(rng), 64000.0 + jitter(rng),
+                      8000.0 + jitter(rng) * 0.3};
+        h.velocity = (cfg.defendedAsset - h.position).normalized() * 380.0;
+        h.type     = EntityType::Hostile;
+        engine.spawn(h);
+    }
+    // Background friendly air traffic so filtering is visible in the feed.
+    for (int i = 0; i < 40; ++i) {
+        Entity f;
+        f.position = {jitter(rng) + 40000.0, jitter(rng) + 40000.0,
+                      6000.0 + jitter(rng) * 0.2};
+        f.velocity = {jitter(rng) * 0.02, jitter(rng) * 0.02, 0.0};
+        f.type     = EntityType::Neutral;
+        engine.spawn(f);
+    }
+    for (int i = 0; i < 24; ++i) {
+        const double a = (2.0 * 3.14159265 * i) / 24.0;
+        mgr.deployInterceptor(
+            cfg.defendedAsset +
+                Vector3{8000.0 * std::cos(a), 8000.0 * std::sin(a), 500.0},
+            1200.0);
+    }
+
+    tlm::ShmPublisher publisher(tlm::kDefaultShmName, /*unlinkOnClose=*/true);
+    std::vector<tlm::TelemetryRecord> records; // reused; no per-frame alloc
+    records.reserve(tlm::kMaxRecordsPerFrame);
+
+    std::cout << "== Telemetry publisher ==\n"
+              << "  shm      : " << publisher.name() << "\n"
+              << "  duration : " << durationSec << " s @ 60 Hz\n"
+              << "  run the monitor:  ./telemetry_monitor\n\n";
+
+    const auto start = std::chrono::steady_clock::now();
+    std::uint64_t frameId = 0;
+    const int totalFrames = static_cast<int>(durationSec * 60.0);
+    for (int f = 0; f < totalFrames; ++f) {
+        mgr.update(dt);
+
+        records.clear();
+        for (const Entity& e : engine.entities()) {
+            if (!e.isActive()) continue;
+            records.push_back(
+                tlm::makeRecord(e, tlm::classifyThreat(e, cfg.defendedAsset)));
+        }
+
+        const std::uint64_t ts = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        publisher.publish(frameId++, ts,
+                          static_cast<std::uint32_t>(mgr.interceptCount()),
+                          records.data(),
+                          static_cast<std::uint32_t>(records.size()));
+
+        std::this_thread::sleep_until(start + std::chrono::duration<double>(
+                                                  (f + 1) * dt));
+    }
+
+    std::cout << "Telemetry publisher finished: " << frameId << " frames, "
+              << mgr.interceptCount() << " intercepts.\n";
+}
+#endif // SIM_HAVE_TELEMETRY
+
 } // namespace
 
 int main(int argc, char** argv) {
+    const std::string mode = (argc > 1) ? argv[1] : "";
+
+    if (mode == "telemetry") {
+#if defined(SIM_HAVE_TELEMETRY)
+        const double seconds = (argc > 2) ? std::stod(argv[2]) : 20.0;
+        runTelemetryPublisher(seconds);
+        return 0;
+#else
+        std::cerr << "Telemetry (POSIX shared memory) is Linux-only; "
+                     "this build does not include it.\n";
+        return 1;
+#endif
+    }
+
     const std::size_t entityCount = (argc > 1) ? std::stoul(argv[1]) : 10000;
     const int         frames      = (argc > 2) ? std::stoi(argv[2]) : 60;
 
-    std::cout << "Defense Simulation - Phases 1 & 2\n\n";
+    std::cout << "Defense Simulation - Phases 1-3\n\n";
     runPerformanceDemo(entityCount, frames);
     runEngagementDemo();
     return 0;

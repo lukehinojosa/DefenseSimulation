@@ -5,9 +5,10 @@ interception. Built to demonstrate the low-level engineering that defense
 programs care about: cache-friendly data layout, hand-written spatial math,
 lock-free-style parallelism, and rigorous unit testing.
 
-> **Status:** Phases 1 & 2 complete — core engine + spatial math, and
-> closed-loop ProNav guidance with automated engagement. Phase 3 (Linux IPC
-> telemetry) is planned; see [`Plan.md`](Plan.md).
+> **Status:** All three phases complete — core engine + spatial math,
+> closed-loop ProNav guidance with automated engagement, and a Linux IPC
+> telemetry pipeline (POSIX shared memory + UDP) feeding a separate monitor
+> process. See [`Plan.md`](Plan.md).
 
 ---
 
@@ -85,6 +86,53 @@ neutralizes all 12 threats, resolving in ~46 s of simulated time.
 
 ---
 
+## Phase 3 — Linux IPC Telemetry
+
+> **Linux-only.** These targets build on Unix (developed/tested on a Raspberry
+> Pi 4, aarch64, Debian 12). On Windows the CMake project silently omits them
+> and still builds Phases 1–2.
+
+| Deliverable | Where |
+|---|---|
+| Byte-packed binary packet protocol (record + frame header) | [`include/sim/Telemetry.hpp`](include/sim/Telemetry.hpp) |
+| POSIX shared-memory seqlock ring buffer (zero-alloc, lock-free) | [`include/sim/SharedMemoryChannel.hpp`](include/sim/SharedMemoryChannel.hpp) · [`src/SharedMemoryChannel.cpp`](src/SharedMemoryChannel.cpp) |
+| UDP sender/receiver (remote transport fallback) | [`include/sim/UdpTelemetry.hpp`](include/sim/UdpTelemetry.hpp) · [`src/UdpTelemetry.cpp`](src/UdpTelemetry.cpp) |
+| Secondary monitoring executable | [`src/telemetry_monitor.cpp`](src/telemetry_monitor.cpp) |
+| IPC GTest suite (round-trip, seqlock stress, UDP) | [`tests/test_telemetry.cpp`](tests/test_telemetry.cpp) |
+
+### Design highlights
+
+- **Fixed wire format.** `TelemetryRecord` (30 B) and `FrameHeader` (32 B) are
+  `#pragma pack`-ed and guarded by `static_assert` on their sizes, so the
+  protocol can't silently drift across compilers. Positions narrow to `float`
+  to keep datagrams compact.
+- **Lock-free shared memory via a seqlock ring.** The producer maps a fixed
+  POD region (`shm_open` + `mmap`), and publishes each frame into the next of
+  N ring slots guarded by a per-slot sequence counter (odd = writing). Readers
+  snapshot the latest slot and re-check the counter; with ring depth ≥ 3 the
+  writer has always moved on, so reads never tear. Cross-process atomics are
+  `static_assert`-ed lock-free. **No allocation occurs on the publish path** —
+  records are `memcpy`-ed straight into the mapping.
+- **Decoupled monitor process.** `telemetry_monitor` is a pure consumer: it
+  attaches read-only and reports live threat tallies, intercept count, and the
+  measured telemetry frame rate — the command-and-display process from the
+  architecture diagram.
+- **UDP fallback.** A single datagram carries the header plus up to 45 records
+  (kept under a typical MTU); oversize frames are clamped rather than
+  fragmented.
+
+### Running the pipeline (two terminals)
+
+```bash
+# Terminal 1 — run the sim, publishing telemetry to /defsim_telemetry for 20 s
+./build/defense_sim telemetry 20
+
+# Terminal 2 — attach the monitor
+./build/telemetry_monitor
+```
+
+---
+
 ## Building
 
 Requires CMake 3.20+ and a C++17 compiler. GoogleTest is fetched
@@ -112,17 +160,50 @@ ctest --test-dir build --output-on-failure
 
 Build without tests with `-DSIM_BUILD_TESTS=OFF`.
 
+### Profiling (Linux)
+
+Verified on a Raspberry Pi 4 (Cortex-A72, 4 cores, Debian 12).
+
+**Valgrind — zero leaks** across the engine, thread pool, octree, engagement
+manager, and the shared-memory publisher (`shm_open`/`mmap`/`munmap`/
+`shm_unlink`):
+
+```bash
+valgrind --leak-check=full --error-exitcode=42 ./build/defense_sim telemetry 2
+# ==> in use at exit: 0 bytes in 0 blocks
+# ==> ERROR SUMMARY: 0 errors from 0 contexts
+```
+
+**perf — cache utilization** for 20,000 entities × 60 frames:
+
+```bash
+perf stat -e instructions,cycles,cache-references,cache-misses \
+          ./build/defense_sim 20000 60
+```
+
+| Metric | Value |
+|---|---|
+| L1 d-cache miss rate | **3.89%** (≈96% hit rate) |
+| Per-frame time (Pi, 4 cores) | ~12.3 ms — within the 16.7 ms / 60 Hz budget |
+
+The low miss rate reflects the standard-layout entity array and the octree's
+contiguous per-node item storage.
+
 ---
 
 ## Layout
 
 ```
 include/sim/   Public headers (math, entities, octree, thread pool, engine,
-               guidance, engagement manager)
-src/           Octree / engine / engagement implementation and the demo
+               guidance, engagement, telemetry, shm channel, UDP)
+src/           Implementation, the demo (defense_sim), and telemetry_monitor
 tests/         GoogleTest suites (one per component)
 Plan.md        Full three-phase roadmap
 ```
+
+Phase 3's shared-memory and UDP targets build only under `UNIX`; the
+`defense_sim telemetry` mode and `telemetry_monitor` executable appear only in
+Linux builds.
 
 ## Target environment
 
