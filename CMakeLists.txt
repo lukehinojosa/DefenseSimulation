@@ -20,6 +20,7 @@ find_package(Threads REQUIRED)
 add_library(sim_core
     src/Octree.cpp
     src/SimulationEngine.cpp
+    src/EngagementManager.cpp
 )
 target_include_directories(sim_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(sim_core PUBLIC Threads::Threads)
@@ -60,6 +61,8 @@ if(SIM_BUILD_TESTS)
         tests/test_boundingbox.cpp
         tests/test_octree.cpp
         tests/test_engine.cpp
+        tests/test_guidance.cpp
+        tests/test_engagement.cpp
     )
     target_link_libraries(sim_tests PRIVATE sim_core GTest::gtest_main)
 

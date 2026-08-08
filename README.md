@@ -5,9 +5,9 @@ interception. Built to demonstrate the low-level engineering that defense
 programs care about: cache-friendly data layout, hand-written spatial math,
 lock-free-style parallelism, and rigorous unit testing.
 
-> **Status:** Phase 1 complete — core engine, spatial math, and the
-> multithreaded octree. Phases 2 (ProNav guidance) and 3 (Linux IPC telemetry)
-> are planned; see [`Plan.md`](Plan.md).
+> **Status:** Phases 1 & 2 complete — core engine + spatial math, and
+> closed-loop ProNav guidance with automated engagement. Phase 3 (Linux IPC
+> telemetry) is planned; see [`Plan.md`](Plan.md).
 
 ---
 
@@ -52,6 +52,39 @@ The 60 Hz frame budget is 16.7 ms; Phase 1 clears it with room to spare.
 
 ---
 
+## Phase 2 — ProNav Guidance & Intercept
+
+| Deliverable | Where |
+|---|---|
+| Proportional Navigation guidance law + LOS-rate / closing-speed / time-to-go math | [`include/sim/Guidance.hpp`](include/sim/Guidance.hpp) |
+| Automated engagement manager: threat priority queue, target assignment, proximity fuze | [`include/sim/EngagementManager.hpp`](include/sim/EngagementManager.hpp) · [`src/EngagementManager.cpp`](src/EngagementManager.cpp) |
+| ProNav convergence + engagement GTest suites (13 tests) | [`tests/test_guidance.cpp`](tests/test_guidance.cpp) · [`tests/test_engagement.cpp`](tests/test_engagement.cpp) |
+
+### Design highlights
+
+- **True Proportional Navigation.** `a_c = N·(V_r × Ω)` with
+  `Ω = (R × V_r)/(R·R)`. The command vanishes on a collision course (zero LOS
+  rate) and otherwise nulls the LOS rotation, driving intercept. Interceptors
+  steer at constant cruise speed (the lateral command rotates the velocity
+  vector). Convergence is proven in closed-loop tests against crossing,
+  inbound-3D, and sinusoidally-weaving maneuvering targets for N ∈ {3,4,5}.
+- **Threat prioritization.** Hostiles are ranked by time-to-impact against the
+  defended asset (proximity breaks ties). Targeting queries go through the
+  octree with the `QUERY_HOSTILE_ONLY` bitmask, so friendlies and neutrals
+  never enter a firing solution; interceptors are assigned distinct threats.
+- **Octree proximity fuze.** Each frame a fuze-radius cube around every
+  interceptor is queried for hostiles and confirmed with an exact spherical
+  range test; a hit destroys (despawns) both the interceptor and the threat.
+- **Terminal-phase realism.** Achievable miss distance at a fixed 60 Hz step is
+  bounded by roughly half the per-frame travel, which is why proximity fuzes
+  are radius-sized rather than requiring exact contact — reflected in both the
+  demo and the test tolerances.
+
+The demo's 12-vs-12 salvo (Mach-3 interceptors, Mach-1 inbound threats)
+neutralizes all 12 threats, resolving in ~46 s of simulated time.
+
+---
+
 ## Building
 
 Requires CMake 3.20+ and a C++17 compiler. GoogleTest is fetched
@@ -84,8 +117,9 @@ Build without tests with `-DSIM_BUILD_TESTS=OFF`.
 ## Layout
 
 ```
-include/sim/   Public headers (math, entities, octree, thread pool, engine)
-src/           Octree / engine implementation and the demo executable
+include/sim/   Public headers (math, entities, octree, thread pool, engine,
+               guidance, engagement manager)
+src/           Octree / engine / engagement implementation and the demo
 tests/         GoogleTest suites (one per component)
 Plan.md        Full three-phase roadmap
 ```

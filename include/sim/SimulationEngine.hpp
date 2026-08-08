@@ -55,6 +55,20 @@ public:
         octree_.queryRange(range, filter, out);
     }
 
+    /**
+     * @brief O(1) lookup of an entity by id.
+     *
+     * Spawn assigns ids sequentially and entities are never erased (they are
+     * marked Destroyed in place), so id equals the array index for the life of
+     * the engine. Returns nullptr if @p id was never spawned.
+     */
+    Entity* entityById(EntityId id) {
+        return (id < entities_.size()) ? &entities_[id] : nullptr;
+    }
+    const Entity* entityById(EntityId id) const {
+        return (id < entities_.size()) ? &entities_[id] : nullptr;
+    }
+
     // --- Accessors ---------------------------------------------------------
     std::vector<Entity>&       entities()       { return entities_; }
     const std::vector<Entity>& entities() const { return entities_; }
