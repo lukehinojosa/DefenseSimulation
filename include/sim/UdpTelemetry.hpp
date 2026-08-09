@@ -6,19 +6,25 @@
 
 #include "sim/Telemetry.hpp"
 
+// Socket handle stored platform-neutrally: POSIX fds are int, Winsock SOCKETs
+// are UINT_PTR. std::intptr_t holds either without truncation; -1 means unset.
+
 namespace sim {
 namespace telemetry {
 
-/// Records that fit one ~1.4 KB datagram alongside the header (stays < MTU).
-constexpr std::uint32_t kUdpMaxRecords = 45;
+/// Byte budget for one datagram payload (kept under a typical 1472 B MTU).
+constexpr std::size_t kUdpDatagramBudget = 1400;
+/// Decode-side capacity. With the compact codec (~12-15 B/record) far more
+/// tracks fit per datagram than the old fixed 35 B layout allowed.
+constexpr std::uint32_t kUdpMaxRecords = 120;
 
 /**
- * @brief UDP sender for telemetry frames (remote transport fallback).
+ * @brief UDP sender for telemetry frames (remote transport).
  *
- * Each frame is sent as a single datagram: a FrameHeader followed by up to
- * kUdpMaxRecords records (the highest-threat records when the frame is larger,
- * chosen by the caller). Serialization uses a fixed stack buffer, so no heap
- * allocation occurs on the send path.
+ * Each frame is sent as a single datagram encoded with the compact binary codec
+ * (see TelemetryCodec.hpp): a small variable-length header plus greedily packed,
+ * priority-ordered records (~12-15 B each vs 35 B raw). Serialization uses a
+ * fixed stack buffer, so no heap allocation occurs on the send path.
  */
 class UdpTelemetrySender {
 public:
@@ -36,7 +42,7 @@ public:
               std::uint32_t count);
 
 private:
-    int fd_{-1};
+    std::intptr_t fd_{-1};
 };
 
 /**
@@ -63,7 +69,7 @@ public:
     std::uint16_t boundPort() const { return boundPort_; }
 
 private:
-    int           fd_{-1};
+    std::intptr_t fd_{-1};
     std::uint16_t boundPort_{0};
 };
 

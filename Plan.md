@@ -27,14 +27,14 @@
                       │  • Fixed-size Binary Structs            │
                       │  • Zero-Allocation Circular Buffer      │
                       │  • Lock-Free Threading / Mutexes        │
-                      └────────────────────┬────────────────────┘
-                                           │
-                                           ▼
-                      ┌─────────────────────────────────────────┐
-                      │       COMMAND & DISPLAY PROCESS         │
-                      │  • 60Hz Telemetry Ingestion            │
-                      │  • Console / Log Display Monitor        │
-                      └─────────────────────────────────────────┘
+                      └───────────┬─────────────────┬───────────┘
+                                  │                 │
+                                  ▼                 ▼
+      ┌───────────────────────────────┐   ┌───────────────────────────────┐
+      │       CONSOLE MONITOR         │   │  3D C2 VISUALIZER (RAYLIB)    │
+      │  • 60Hz Telemetry Ingestion   │   │  • 60Hz IPC Stream Consumer   │
+      │  • Terminal Logging           │   │  • Real-Time Airspace Render  │
+      └───────────────────────────────┘   └───────────────────────────────┘
 
 ```
 
@@ -119,3 +119,42 @@
 4. **CMake & Profiling:**
 * Configure a clean `CMakeLists.txt` managing executable targets, libraries, and GoogleTest dependency links.
 * Run Linux **Valgrind** to verify zero memory leaks and **perf** to verify CPU cache utilization.
+
+
+
+---
+
+## Phase 4: Decoupled 3D Visualizer & Command-and-Control (C2) Display (Raylib)
+
+**Goal:** Build an isolated, real-time 3D tactical visualization executable using Raylib that consumes the Phase 3 POSIX Shared Memory / UDP telemetry pipeline, rendering defended ground assets, active threat trajectories, ProNav intercept vectors, and engagement metrics without injecting rendering overhead into the core simulation loop.
+
+### Key Deliverables:
+
+1. **Shared-Memory Telemetry Consumer Integration:**
+* Attach to the existing POSIX shared-memory seqlock ring buffer or UDP fallback socket as a pure read-only client process.
+* Maintain a local rendering state snapshot updated at 60Hz, ensuring snapshot reads never block the engine process or tear frame payloads.
+
+
+2. **3D Tactical Airspace & Entity Rendering:**
+* Render a $100\text{ km} \times 100\text{ km} \times 20\text{ km}$ coordinate grid with ground-based structures representing defended assets and battery launch sites.
+* Draw dynamic entity tracks categorized by allegiance bitmask:
+* **Hostiles (Red):** Rendered with directional velocity vectors and trailing line ribbons displaying historical trajectory.
+* **Interceptors (Blue/Green):** Rendered with active heading vectors and ProNav Line-of-Sight (LOS) targeting lines connecting to their assigned hostile IDs.
+
+
+* Render proximity fuze detonations as expanding wireframe spheres or localized particle bursts when entity statuses flag as destroyed.
+
+
+3. **Command & Control (C2) HUD & Camera System:**
+* Implement a 2D screen-space overlay displaying real-time C2 telemetry metrics:
+* Active hostile tracks count vs. neutralized threats.
+* Calculated telemetry ingestion frame rate (FPS) and memory channel throughput.
+* Threat status logs and engagement success rates.
+
+
+* Build an interactive 3D arcball camera supporting orbit, pan, zoom, and target-tracking modes to inspect specific air sectors or interceptor engagements.
+
+
+4. **CMake & Modular Build Targets:**
+* Update `CMakeLists.txt` to integrate Raylib via `FetchContent` or `find_package(raylib)`.
+* Configure `SIM_BUILD_VISUALIZER` as an optional CMake build flag, preserving headless compilation compatibility for CLI-only Linux servers or CI/CD testing environments.

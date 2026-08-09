@@ -60,7 +60,8 @@ int main(int argc, char** argv) {
         try {
             sub = std::make_unique<ShmSubscriber>(shmName);
             if (sub->producerReady()) break;
-        } catch (const std::system_error&) {
+        } catch (const std::exception&) {
+            // Shared-memory object not created yet; keep waiting.
             sub.reset();
         }
         if (std::chrono::steady_clock::now() - waitStart >

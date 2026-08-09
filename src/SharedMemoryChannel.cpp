@@ -1,17 +1,28 @@
 #include "sim/SharedMemoryChannel.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
 #include <cstring>
-#include <system_error>
+
+#include <boost/interprocess/mapped_region.hpp>
+#if defined(_WIN32)
+#include <boost/interprocess/windows_shared_memory.hpp>
+#else
+#include <boost/interprocess/shared_memory_object.hpp>
+#endif
 
 namespace sim {
 namespace telemetry {
+
+namespace bip = boost::interprocess;
+
+// Platform-native shared memory: windows_shared_memory (CreateFileMapping,
+// kernel-managed, auto-released when the last handle closes) on Windows;
+// shared_memory_object (POSIX shm_open) on Unix.
+#if defined(_WIN32)
+using ShmObject = bip::windows_shared_memory;
+#else
+using ShmObject = bip::shared_memory_object;
+#endif
 
 // Cross-process seqlock correctness depends on lock-free atomics living in the
 // shared mapping.
@@ -20,45 +31,38 @@ static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
 static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
               "32-bit atomics must be lock-free for cross-process use");
 
-namespace {
-
-[[noreturn]] void throwErrno(const char* what) {
-    throw std::system_error(errno, std::generic_category(), what);
-}
-
-} // namespace
+// Owns the shared-memory object and its mapping. The same seqlock ring layout
+// is placed in the mapping on every platform.
+struct ShmMapping {
+    ShmObject          shm;
+    bip::mapped_region region;
+};
 
 // ---------------------------------------------------------------------------
 // ShmPublisher
 // ---------------------------------------------------------------------------
 ShmPublisher::ShmPublisher(const std::string& name, bool unlinkOnClose)
     : name_(name), unlinkOnClose_(unlinkOnClose) {
-    mappedSize_ = sizeof(SharedRegion);
+    auto m = std::make_unique<ShmMapping>();
+#if defined(_WIN32)
+    // Windows: size is fixed at creation; no truncate, no explicit unlink (the
+    // kernel frees the section when the last handle closes).
+    m->shm = ShmObject(bip::open_or_create, name_.c_str(), bip::read_write,
+                       static_cast<std::size_t>(sizeof(SharedRegion)));
+#else
+    // POSIX: start from a clean segment so the seqlock/control state is well
+    // defined even if a previous run left an object behind.
+    ShmObject::remove(name_.c_str());
+    m->shm = ShmObject(bip::create_only, name_.c_str(), bip::read_write);
+    m->shm.truncate(static_cast<bip::offset_t>(sizeof(SharedRegion)));
+#endif
+    m->region = bip::mapped_region(m->shm, bip::read_write);
 
-    fd_ = ::shm_open(name_.c_str(), O_CREAT | O_RDWR, 0600);
-    if (fd_ == -1) {
-        throwErrno("shm_open");
-    }
-    if (::ftruncate(fd_, static_cast<off_t>(mappedSize_)) == -1) {
-        const int e = errno;
-        ::close(fd_);
-        ::shm_unlink(name_.c_str());
-        throw std::system_error(e, std::generic_category(), "ftruncate");
-    }
+    region_ = static_cast<SharedRegion*>(m->region.get_address());
+    mapping_ = std::move(m);
 
-    void* addr = ::mmap(nullptr, mappedSize_, PROT_READ | PROT_WRITE,
-                        MAP_SHARED, fd_, 0);
-    if (addr == MAP_FAILED) {
-        const int e = errno;
-        ::close(fd_);
-        ::shm_unlink(name_.c_str());
-        throw std::system_error(e, std::generic_category(), "mmap");
-    }
-
-    region_ = static_cast<SharedRegion*>(addr);
-
-    // First mapping of a freshly ftruncate'd object is zero-filled, so the
-    // atomics start at 0. Publish the geometry, then mark the region ready.
+    // A freshly truncated object is zero-filled, so the atomics start at 0.
+    // Publish the geometry, then mark the region ready.
     region_->slotCount  = kSlotCount;
     region_->maxRecords = kMaxRecordsPerFrame;
     region_->latestSlot.store(0, std::memory_order_relaxed);
@@ -69,15 +73,16 @@ ShmPublisher::ShmPublisher(const std::string& name, bool unlinkOnClose)
 }
 
 ShmPublisher::~ShmPublisher() {
-    if (region_ != nullptr) {
-        ::munmap(region_, mappedSize_);
-    }
-    if (fd_ != -1) {
-        ::close(fd_);
-    }
+    mapping_.reset(); // unmap (closes the last handle)
+#if !defined(_WIN32)
+    // POSIX shm persists past process exit, so unlink it explicitly. Windows
+    // sections are reclaimed automatically once the last handle is closed.
     if (unlinkOnClose_) {
-        ::shm_unlink(name_.c_str());
+        ShmObject::remove(name_.c_str());
     }
+#else
+    (void)unlinkOnClose_;
+#endif
 }
 
 void ShmPublisher::publish(std::uint64_t frameId,
@@ -117,29 +122,15 @@ void ShmPublisher::publish(std::uint64_t frameId,
 // ShmSubscriber
 // ---------------------------------------------------------------------------
 ShmSubscriber::ShmSubscriber(const std::string& name) : name_(name) {
-    mappedSize_ = sizeof(SharedRegion);
+    auto m = std::make_unique<ShmMapping>();
+    m->shm = ShmObject(bip::open_only, name_.c_str(), bip::read_only);
+    m->region = bip::mapped_region(m->shm, bip::read_only);
 
-    fd_ = ::shm_open(name_.c_str(), O_RDONLY, 0600);
-    if (fd_ == -1) {
-        throwErrno("shm_open");
-    }
-    void* addr = ::mmap(nullptr, mappedSize_, PROT_READ, MAP_SHARED, fd_, 0);
-    if (addr == MAP_FAILED) {
-        const int e = errno;
-        ::close(fd_);
-        throw std::system_error(e, std::generic_category(), "mmap");
-    }
-    region_ = static_cast<const SharedRegion*>(addr);
+    region_ = static_cast<const SharedRegion*>(m->region.get_address());
+    mapping_ = std::move(m);
 }
 
-ShmSubscriber::~ShmSubscriber() {
-    if (region_ != nullptr) {
-        ::munmap(const_cast<SharedRegion*>(region_), mappedSize_);
-    }
-    if (fd_ != -1) {
-        ::close(fd_);
-    }
-}
+ShmSubscriber::~ShmSubscriber() = default;
 
 bool ShmSubscriber::producerReady() const {
     return region_->ready.load(std::memory_order_acquire) == 1;

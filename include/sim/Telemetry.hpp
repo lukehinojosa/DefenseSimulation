@@ -13,15 +13,21 @@ namespace telemetry {
 
 /// Wire identifiers so a reader can validate a mapping/datagram.
 constexpr std::uint32_t kMagic           = 0x44534d31u; // 'DSM1'
-constexpr std::uint32_t kProtocolVersion = 1u;
+/// v2 adds per-record targetId (for interceptor LOS lines) and a flags byte
+/// (detonation events) so the visualizer can render engagement geometry.
+constexpr std::uint32_t kProtocolVersion = 2u;
+
+/// Sentinel targetId meaning "no assigned target".
+constexpr std::uint32_t kNoTargetId = 0xFFFFFFFFu;
 
 /// Ring geometry. Slots >= 3 let a single writer cycle away from the slot a
 /// reader is copying, so the seqlock almost never has to retry.
 constexpr std::uint32_t kSlotCount        = 4u;
 constexpr std::uint32_t kMaxRecordsPerFrame = 20000u;
 
-/// Default POSIX shared-memory object name (leading slash per shm_open(3)).
-constexpr const char* kDefaultShmName = "/defsim_telemetry";
+/// Default shared-memory object name. No leading slash / special characters so
+/// it is valid for Boost.Interprocess on both POSIX and Windows.
+constexpr const char* kDefaultShmName = "defsim_telemetry";
 
 /// Coarse threat classification carried in each record.
 enum class ThreatLevel : std::uint8_t {
@@ -30,6 +36,12 @@ enum class ThreatLevel : std::uint8_t {
     Medium   = 2,
     High     = 3,
     Critical = 4
+};
+
+/// Per-record status flags (bitmask).
+enum RecordFlags : std::uint8_t {
+    FLAG_NONE      = 0u,
+    FLAG_DESTROYED = 1u << 0  ///< Entity was destroyed this frame (detonation).
 };
 
 #pragma pack(push, 1)
@@ -43,8 +55,10 @@ struct TelemetryRecord {
     std::uint32_t entityId;
     float         posX, posY, posZ;
     float         velX, velY, velZ;
+    std::uint32_t targetId;    // interceptor's assigned hostile, or kNoTargetId
     std::uint8_t  entityType;  // sim::EntityType
     std::uint8_t  threatLevel; // sim::telemetry::ThreatLevel
+    std::uint8_t  flags;       // sim::telemetry::RecordFlags
 };
 
 /// Per-frame header prefixing a block of records (wire format).
@@ -58,8 +72,8 @@ struct FrameHeader {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(TelemetryRecord) == 30,
-              "TelemetryRecord must stay 30 bytes on the wire");
+static_assert(sizeof(TelemetryRecord) == 35,
+              "TelemetryRecord must stay 35 bytes on the wire (protocol v2)");
 static_assert(sizeof(FrameHeader) == 32,
               "FrameHeader must stay 32 bytes on the wire");
 
@@ -82,7 +96,9 @@ inline ThreatLevel classifyThreat(const Entity& e, const Vector3& defendedAsset)
 }
 
 /// Build a wire record from an entity (position/velocity narrowed to float).
-inline TelemetryRecord makeRecord(const Entity& e, ThreatLevel level) {
+inline TelemetryRecord makeRecord(const Entity& e, ThreatLevel level,
+                                  std::uint32_t targetId = kNoTargetId,
+                                  std::uint8_t flags = FLAG_NONE) {
     TelemetryRecord r;
     r.entityId    = e.id;
     r.posX        = static_cast<float>(e.position.x);
@@ -91,9 +107,33 @@ inline TelemetryRecord makeRecord(const Entity& e, ThreatLevel level) {
     r.velX        = static_cast<float>(e.velocity.x);
     r.velY        = static_cast<float>(e.velocity.y);
     r.velZ        = static_cast<float>(e.velocity.z);
+    r.targetId    = targetId;
     r.entityType  = static_cast<std::uint8_t>(e.type);
     r.threatLevel = static_cast<std::uint8_t>(level);
+    r.flags       = flags;
     return r;
+}
+
+/**
+ * @brief Priority score for UDP record selection (higher = more important).
+ *
+ * When more records exist than fit in a datagram, the sender keeps the most
+ * operationally relevant tracks: detonations and interceptors first, then
+ * hostiles by threat level, then everything else.
+ */
+inline int recordPriority(const TelemetryRecord& r) {
+    if (r.flags & FLAG_DESTROYED) return 1000;                 // detonations
+    if (r.entityType == static_cast<std::uint8_t>(EntityType::Friendly) &&
+        r.targetId != kNoTargetId) {
+        return 900;                                            // engaged interceptor
+    }
+    if (r.entityType == static_cast<std::uint8_t>(EntityType::Hostile)) {
+        return 500 + r.threatLevel;                            // hostiles by threat
+    }
+    if (r.entityType == static_cast<std::uint8_t>(EntityType::Friendly)) {
+        return 400;                                            // idle interceptor
+    }
+    return 0;                                                  // neutral
 }
 
 } // namespace telemetry

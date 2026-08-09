@@ -4,12 +4,17 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "sim/Telemetry.hpp"
 
 namespace sim {
 namespace telemetry {
+
+// Owns the Boost.Interprocess shared-memory object + mapping. Defined in the
+// .cpp so Boost stays an implementation detail (keeps it off every includer).
+struct ShmMapping;
 
 /**
  * @brief One ring slot: a seqlock counter guarding a frame header + records.
@@ -51,10 +56,10 @@ struct SharedRegion {
 class ShmPublisher {
 public:
     /**
-     * @param name    POSIX shm object name (e.g. "/defsim_telemetry").
-     * @param unlinkOnClose  If true, shm_unlink() the object in the destructor
-     *        (the owning/producer process should set this).
-     * @throws std::system_error on shm_open/ftruncate/mmap failure.
+     * @param name    Shared-memory object name (e.g. "defsim_telemetry").
+     * @param unlinkOnClose  If true, remove the object in the destructor (the
+     *        owning/producer process should set this).
+     * @throws boost::interprocess::interprocess_exception on mapping failure.
      */
     explicit ShmPublisher(const std::string& name = kDefaultShmName,
                           bool unlinkOnClose = true);
@@ -77,12 +82,11 @@ public:
     const std::string& name() const { return name_; }
 
 private:
-    std::string   name_;
-    bool          unlinkOnClose_;
-    int           fd_{-1};
-    std::size_t   mappedSize_{0};
-    SharedRegion* region_{nullptr};
-    std::uint32_t nextSlot_{0};
+    std::string                 name_;
+    bool                        unlinkOnClose_;
+    std::unique_ptr<ShmMapping> mapping_;
+    SharedRegion*               region_{nullptr};
+    std::uint32_t               nextSlot_{0};
 };
 
 /**
@@ -118,10 +122,9 @@ public:
                 std::uint32_t& outCount) const;
 
 private:
-    std::string         name_;
-    int                 fd_{-1};
-    std::size_t         mappedSize_{0};
-    const SharedRegion* region_{nullptr};
+    std::string                 name_;
+    std::unique_ptr<ShmMapping> mapping_;
+    const SharedRegion*         region_{nullptr};
 };
 
 } // namespace telemetry

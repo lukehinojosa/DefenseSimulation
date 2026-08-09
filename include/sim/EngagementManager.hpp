@@ -89,6 +89,11 @@ public:
     int  interceptCount() const { return interceptCount_; }
     const Config& config() const { return config_; }
 
+    /// Entity ids destroyed during the most recent processDetonations() call
+    /// (interceptor + target pairs). Consumed by the telemetry publisher to
+    /// emit one-frame detonation events.
+    const std::vector<EntityId>& lastDestroyed() const { return lastDestroyed_; }
+
     /// Active interceptors that still have an assigned, living target.
     int activeEngagements() const;
 
@@ -99,6 +104,7 @@ private:
     SimulationEngine&        engine_;
     Config                   config_;
     std::vector<Interceptor> interceptors_;
+    std::vector<EntityId>    lastDestroyed_;
     int                      interceptCount_{0};
     bool                     primed_{false};
 };

@@ -5,10 +5,44 @@ interception. Built to demonstrate the low-level engineering that defense
 programs care about: cache-friendly data layout, hand-written spatial math,
 lock-free-style parallelism, and rigorous unit testing.
 
-> **Status:** All three phases complete — core engine + spatial math,
-> closed-loop ProNav guidance with automated engagement, and a Linux IPC
-> telemetry pipeline (POSIX shared memory + UDP) feeding a separate monitor
-> process. See [`Plan.md`](Plan.md).
+> **Status:** All four phases complete — core engine + spatial math,
+> closed-loop ProNav guidance with automated engagement, a Linux IPC telemetry
+> pipeline (POSIX shared memory + UDP), and a decoupled Raylib 3D C2 visualizer
+> that consumes either transport through one abstraction. See [`Plan.md`](Plan.md).
+
+---
+
+## Architecture
+
+The simulation runs as one process and streams state to separate, read-only
+display processes — so rendering and monitoring add zero overhead to the engine
+loop. Consumers depend only on a transport-agnostic interface, so the same
+binaries work over local shared memory or a remote UDP link.
+
+```mermaid
+flowchart TB
+    subgraph ENGINE["Simulation Engine · defense_sim"]
+        direction TB
+        TP["ThreadPool — parallel 60 Hz kinematics"]
+        OCT["Octree — 100×100×20 km spatial index"]
+        GUID["ProNav Guidance — LOS-rate steering"]
+        ENG["Engagement Manager — threat queue · proximity fuze"]
+        TP --> OCT --> GUID --> ENG
+    end
+
+    ENGINE -->|"publish every frame"| PUB["Telemetry Publisher"]
+
+    PUB -->|"local · zero-copy"| SHM["Shared-Memory Seqlock Ring<br/>Boost.Interprocess<br/>windows_shared_memory · shared_memory_object"]
+    PUB -->|"remote · compact codec"| UDP["UDP Datagrams<br/>zig-zag + VLQ binary codec"]
+
+    SHM --> IFACE["ITelemetryConsumer"]
+    UDP --> IFACE
+
+    IFACE --> MON["telemetry_monitor<br/>threat / rate console"]
+    IFACE --> VIZ["c2_visualizer<br/>Raylib 3D C2 display"]
+```
+
+Everything above builds and runs on both **Windows (MSVC)** and **Linux**.
 
 ---
 
@@ -88,14 +122,16 @@ neutralizes all 12 threats, resolving in ~46 s of simulated time.
 
 ## Phase 3 — Linux IPC Telemetry
 
-> **Linux-only.** These targets build on Unix (developed/tested on a Raspberry
-> Pi 4, aarch64, Debian 12). On Windows the CMake project silently omits them
-> and still builds Phases 1–2.
+> **Cross-platform.** The shared-memory channel uses **Boost.Interprocess**
+> (POSIX shm on Unix, a native file mapping on Windows), so the publisher,
+> monitor, and `--source shm` visualizer run natively on Windows and Linux
+> alike. Developed/tested on a Raspberry Pi 4 (aarch64, Debian 12) and Windows
+> (MSVC). Boost is header-only here — from `libboost-dev` (apt) or vcpkg.
 
 | Deliverable | Where |
 |---|---|
 | Byte-packed binary packet protocol (record + frame header) | [`include/sim/Telemetry.hpp`](include/sim/Telemetry.hpp) |
-| POSIX shared-memory seqlock ring buffer (zero-alloc, lock-free) | [`include/sim/SharedMemoryChannel.hpp`](include/sim/SharedMemoryChannel.hpp) · [`src/SharedMemoryChannel.cpp`](src/SharedMemoryChannel.cpp) |
+| Shared-memory seqlock ring buffer, zero-alloc/lock-free (Boost.Interprocess) | [`include/sim/SharedMemoryChannel.hpp`](include/sim/SharedMemoryChannel.hpp) · [`src/SharedMemoryChannel.cpp`](src/SharedMemoryChannel.cpp) |
 | UDP sender/receiver (remote transport fallback) | [`include/sim/UdpTelemetry.hpp`](include/sim/UdpTelemetry.hpp) · [`src/UdpTelemetry.cpp`](src/UdpTelemetry.cpp) |
 | Secondary monitoring executable | [`src/telemetry_monitor.cpp`](src/telemetry_monitor.cpp) |
 | IPC GTest suite (round-trip, seqlock stress, UDP) | [`tests/test_telemetry.cpp`](tests/test_telemetry.cpp) |
@@ -107,24 +143,33 @@ neutralizes all 12 threats, resolving in ~46 s of simulated time.
   protocol can't silently drift across compilers. Positions narrow to `float`
   to keep datagrams compact.
 - **Lock-free shared memory via a seqlock ring.** The producer maps a fixed
-  POD region (`shm_open` + `mmap`), and publishes each frame into the next of
-  N ring slots guarded by a per-slot sequence counter (odd = writing). Readers
-  snapshot the latest slot and re-check the counter; with ring depth ≥ 3 the
-  writer has always moved on, so reads never tear. Cross-process atomics are
-  `static_assert`-ed lock-free. **No allocation occurs on the publish path** —
-  records are `memcpy`-ed straight into the mapping.
+  POD region and publishes each frame into the next of N ring slots guarded by
+  a per-slot sequence counter (odd = writing). Readers snapshot the latest slot
+  and re-check the counter; with ring depth ≥ 3 the writer has always moved on,
+  so reads never tear. Cross-process atomics are `static_assert`-ed lock-free.
+  **No allocation occurs on the publish path** — records are `memcpy`-ed
+  straight into the mapping. The mapping is created with Boost.Interprocess,
+  specialized per platform: `windows_shared_memory` (native `CreateFileMapping`,
+  kernel-reclaimed) on Windows, `shared_memory_object` (`shm_open`) on POSIX.
+- **Compact binary codec for UDP.** Rather than shipping fixed 35 B records,
+  the UDP transport encodes each frame with a custom codec (`TelemetryCodec.hpp`):
+  zig-zag + variable-length-quantity integers, positions quantized to meters and
+  velocities to m/s, allegiance/threat/flags packed into one byte. That drops a
+  record to ~12–15 B and lets the sender greedily pack the highest-priority
+  tracks that fit a single datagram — so the **entire scene** now travels in one
+  packet, where the raw layout capped a datagram at ~40 tracks.
 - **Decoupled monitor process.** `telemetry_monitor` is a pure consumer: it
   attaches read-only and reports live threat tallies, intercept count, and the
   measured telemetry frame rate — the command-and-display process from the
   architecture diagram.
-- **UDP fallback.** A single datagram carries the header plus up to 45 records
-  (kept under a typical MTU); oversize frames are clamped rather than
-  fragmented.
+- **UDP transport.** A single datagram carries a codec-encoded frame (see the
+  binary codec above), kept under a typical MTU; when a scene is too large the
+  sender keeps the highest-priority tracks that fit rather than fragmenting.
 
 ### Running the pipeline (two terminals)
 
 ```bash
-# Terminal 1 — run the sim, publishing telemetry to /defsim_telemetry for 20 s
+# Terminal 1 — run the sim, publishing telemetry to defsim_telemetry for 20 s
 ./build/defense_sim telemetry 20
 
 # Terminal 2 — attach the monitor
@@ -133,11 +178,87 @@ neutralizes all 12 threats, resolving in ~46 s of simulated time.
 
 ---
 
+## Phase 4 — Decoupled 3D C2 Visualizer (Raylib)
+
+> **Optional target.** Off by default (`-DSIM_BUILD_VISUALIZER=ON` to enable),
+> so headless servers and CI still build Phases 1–3 without a graphics stack.
+
+A standalone, read-only 3D tactical display that consumes the Phase 3 telemetry
+and renders the airspace, tracks, ProNav intercept geometry, detonations, and a
+Command-and-Control HUD — injecting zero overhead into the engine process.
+
+| Deliverable | Where |
+|---|---|
+| Transport-agnostic consumer interface | [`include/sim/ITelemetryConsumer.hpp`](include/sim/ITelemetryConsumer.hpp) |
+| Shared-memory consumer (local) | [`include/sim/ShmTelemetryConsumer.hpp`](include/sim/ShmTelemetryConsumer.hpp) · [`src/ShmTelemetryConsumer.cpp`](src/ShmTelemetryConsumer.cpp) |
+| UDP consumer (remote, cross-platform) | [`include/sim/UdpTelemetryConsumer.hpp`](include/sim/UdpTelemetryConsumer.hpp) · [`src/UdpTelemetryConsumer.cpp`](src/UdpTelemetryConsumer.cpp) |
+| Raylib visualizer (camera, HUD, rendering) | [`src/c2_visualizer.cpp`](src/c2_visualizer.cpp) |
+
+### Design highlights
+
+- **One binary, two transports.** The visualizer depends only on
+  `ITelemetryConsumer`; a `--source shm|udp` flag selects
+  `ShmTelemetryConsumer` (POSIX seqlock ring, local) or `UdpTelemetryConsumer`
+  (cross-platform sockets, remote). The same executable runs locally on the Pi
+  over shared memory or on a Windows PC over UDP/Tailscale.
+- **Fully cross-platform.** The UDP layer (`sim_net`) compiles against POSIX
+  sockets on Linux and Winsock2 on Windows, and the shared-memory channel uses
+  Boost.Interprocess — so the engine, both transports, and the display all run
+  natively on either OS.
+- **Bandwidth-aware remote feed.** Telemetry protocol **v2** adds a per-record
+  `targetId` (interceptor→hostile LOS lines) and a `flags` byte (detonation
+  events). When the scene exceeds one datagram, the sender keeps the highest
+  priority records — detonations, engaged interceptors, then hostiles by threat
+  — so the remote view always shows the decisive engagement geometry.
+- **Rendering.** Hostiles (threat-colored) with velocity vectors and trailing
+  ribbons; interceptors (blue idle / green engaged) with heading vectors and
+  ProNav LOS lines to their assigned target; detonations as expanding fading
+  wireframe spheres; a 100×100×20 km grid with the defended asset. The C2 HUD
+  shows active vs. neutralized threats, success rate, and the measured telemetry
+  rate/throughput. An arcball camera orbits, pans, zooms, and target-tracks
+  individual entities (`Tab`).
+
+### Running
+
+```bash
+# Local, on the Pi (shared memory)
+./build/defense_sim telemetry 60 &
+./build/c2_visualizer --source shm
+
+# Remote: Pi streams UDP to a Windows PC over Tailscale
+#   on the Pi:
+./build/defense_sim telemetry 60 <windows-tailscale-ip> 9090
+#   on Windows:
+c2_visualizer.exe --source udp --port 9090
+```
+
+---
+
 ## Building
 
-Requires CMake 3.20+ and a C++17 compiler. GoogleTest is fetched
+Requires CMake 3.20+, a C++17 compiler, and **Boost** (header-only
+Boost.Interprocess) — from `libboost-dev` on Debian/Ubuntu, or vcpkg on Windows
+(`vcpkg install boost-interprocess`; the Windows presets point at the vcpkg
+toolchain). GoogleTest (and, for the visualizer, Raylib 5.5) are fetched
 automatically via CMake `FetchContent` (needs network access on first
 configure).
+
+### CMake Presets (recommended — one CLion profile builds everything)
+
+[`CMakePresets.json`](CMakePresets.json) defines ready-made profiles. In CLion
+they appear directly as profiles; pick **Windows x64 Debug (MSVC)** and every
+target — engine, tests, and the `c2_visualizer` — builds under MSVC in a single
+profile. From the command line:
+
+```bash
+cmake --preset windows-debug          # MSVC, Visual Studio generator, viz ON
+cmake --build build/windows-debug --config Debug
+ctest --preset windows-debug          # 47 tests (Phases 1-2 + protocol/UDP)
+```
+
+Presets: `windows-debug` / `windows-release` (MSVC, visualizer on),
+`linux-release` (Pi/WSL, full IPC + visualizer), `linux-headless` (no
+visualizer, for CI/servers).
 
 ### Linux / macOS
 
@@ -160,13 +281,27 @@ ctest --test-dir build --output-on-failure
 
 Build without tests with `-DSIM_BUILD_TESTS=OFF`.
 
+### Visualizer (optional, Raylib)
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSIM_BUILD_VISUALIZER=ON
+cmake --build build --target c2_visualizer -j
+```
+
+Raylib resolves from an installed package first (`find_package(raylib)` — e.g.
+`vcpkg install raylib` on Windows, which provides a matching header + lib + DLL),
+and falls back to building from source via `FetchContent` (raylib 5.5) when none
+is installed. On Linux, source builds need the usual X11/GL dev packages (e.g.
+`libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev libxi-dev
+libxcursor-dev`). The target is verified headless with `xvfb-run` + software Mesa
+on the Pi, and runs natively on Windows/MSVC.
+
 ### Profiling (Linux)
 
 Verified on a Raspberry Pi 4 (Cortex-A72, 4 cores, Debian 12).
 
 **Valgrind — zero leaks** across the engine, thread pool, octree, engagement
-manager, and the shared-memory publisher (`shm_open`/`mmap`/`munmap`/
-`shm_unlink`):
+manager, and the Boost.Interprocess shared-memory publisher:
 
 ```bash
 valgrind --leak-check=full --error-exitcode=42 ./build/defense_sim telemetry 2
@@ -191,19 +326,93 @@ contiguous per-node item storage.
 
 ---
 
+## Running
+
+The demo, the telemetry pipeline, and the visualizer all run on **Windows** and
+**Linux**. Paths below assume the MSVC preset on Windows
+(`build/windows-debug/Debug/…`) and a Release build on Linux (`build/…`).
+
+**Simulation demo** (performance + 12-vs-12 engagement):
+
+```powershell
+# Windows
+.\build\windows-debug\Debug\defense_sim.exe 10000 60
+```
+
+```bash
+# Linux
+./build/defense_sim 10000 60
+```
+
+**Telemetry pipeline** — publisher + separate monitor over shared memory (two
+terminals):
+
+```powershell
+# Windows
+.\build\windows-debug\Debug\defense_sim.exe telemetry 30    # terminal 1
+.\build\windows-debug\Debug\telemetry_monitor.exe           # terminal 2
+```
+
+```bash
+# Linux
+./build/defense_sim telemetry 30 &
+./build/telemetry_monitor
+```
+
+**3D C2 visualizer** — local over shared memory:
+
+```powershell
+# Windows (terminal 1, then terminal 2)
+.\build\windows-debug\Debug\defense_sim.exe telemetry 60
+.\build\windows-debug\Debug\c2_visualizer.exe --source shm
+```
+
+```bash
+# Linux
+./build/defense_sim telemetry 60 &
+./build/c2_visualizer --source shm
+```
+
+...or remote, with the engine on one host streaming UDP to the display on
+another (e.g. Pi → Windows over Tailscale):
+
+```bash
+# engine host — stream to the display's IP
+./build/defense_sim telemetry 60 <display-ip> 9090
+```
+
+```powershell
+# display host (Windows)
+.\build\windows-debug\Debug\c2_visualizer.exe --source udp --port 9090
+```
+
+Visualizer controls: drag to orbit, wheel to zoom, `WASD`/`QE` to pan, `Tab` to
+cycle target-tracking, `C` for free camera.
+
+> On Windows, the first inbound UDP datagram may be blocked by Windows Defender
+> Firewall — allow the app when prompted, or add a rule for UDP 9090. The local
+> shared-memory path needs no firewall changes.
+
+---
+
 ## Layout
 
 ```
 include/sim/   Public headers (math, entities, octree, thread pool, engine,
-               guidance, engagement, telemetry, shm channel, UDP)
-src/           Implementation, the demo (defense_sim), and telemetry_monitor
+               guidance, engagement, telemetry, shm channel, UDP, consumers)
+src/           Implementation + executables: defense_sim, telemetry_monitor,
+               c2_visualizer
 tests/         GoogleTest suites (one per component)
-Plan.md        Full three-phase roadmap
+Plan.md        Full four-phase roadmap
 ```
 
-Phase 3's shared-memory and UDP targets build only under `UNIX`; the
-`defense_sim telemetry` mode and `telemetry_monitor` executable appear only in
-Linux builds.
+**Targets by platform.** Everything is cross-platform. `sim_core` (engine),
+`sim_net` (UDP, POSIX/Winsock), and `sim_ipc` (shared memory via
+Boost.Interprocess) build on Windows and Linux, so `defense_sim` (incl. the
+`telemetry` publish mode), `telemetry_monitor`, and `c2_visualizer` (both
+`--source shm` and `--source udp`) run on either OS. The visualizer is gated
+behind `-DSIM_BUILD_VISUALIZER=ON` (on by default in the presets) to keep
+headless/CI builds free of a graphics stack.
 
 ## Target environment
 

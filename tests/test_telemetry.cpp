@@ -1,26 +1,35 @@
+// POSIX shared-memory telemetry tests (Linux only). The cross-platform wire
+// protocol and UDP tests live in test_udp.cpp so they also run under MSVC.
+
 #include <gtest/gtest.h>
 
+#if defined(_WIN32)
+#include <process.h>
+#define SIM_GETPID _getpid
+#else
 #include <unistd.h>
+#define SIM_GETPID getpid
+#endif
 
 #include <atomic>
-#include <cstring>
-#include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "sim/SharedMemoryChannel.hpp"
+#include "sim/ShmTelemetryConsumer.hpp"
 #include "sim/Telemetry.hpp"
-#include "sim/UdpTelemetry.hpp"
 
 using namespace sim;
 using namespace sim::telemetry;
 
 namespace {
 
-// Unique shm name per test so parallel/leftover runs don't collide.
+// Unique shm name per test so parallel/leftover runs don't collide. No leading
+// slash / special characters (valid for Boost.Interprocess on all platforms).
 std::string uniqueName(const char* tag) {
-    return std::string("/defsim_test_") + tag + "_" +
-           std::to_string(::getpid());
+    return std::string("defsim_test_") + tag + "_" +
+           std::to_string(SIM_GETPID());
 }
 
 TelemetryRecord makeRec(std::uint32_t id, float x, std::uint8_t level) {
@@ -33,53 +42,6 @@ TelemetryRecord makeRec(std::uint32_t id, float x, std::uint8_t level) {
 }
 
 } // namespace
-
-TEST(Telemetry, PacketLayoutIsStable) {
-    // Wire contract: sizes must not drift across compilers/versions.
-    EXPECT_EQ(sizeof(TelemetryRecord), 30u);
-    EXPECT_EQ(sizeof(FrameHeader), 32u);
-}
-
-TEST(Telemetry, RecordRoundTripsThroughFloats) {
-    Entity e;
-    e.id       = 42;
-    e.position = {12345.5, 67890.25, 9000.0};
-    e.velocity = {-250.0, 100.0, -12.5};
-    e.type     = EntityType::Friendly;
-    auto r = makeRecord(e, ThreatLevel::Medium);
-
-    EXPECT_EQ(r.entityId, 42u);
-    EXPECT_FLOAT_EQ(r.posX, 12345.5f);
-    EXPECT_FLOAT_EQ(r.velX, -250.0f);
-    EXPECT_EQ(r.entityType, static_cast<std::uint8_t>(EntityType::Friendly));
-    EXPECT_EQ(r.threatLevel, static_cast<std::uint8_t>(ThreatLevel::Medium));
-}
-
-TEST(Telemetry, ThreatClassificationByTimeToImpact) {
-    const Vector3 asset{0.0, 0.0, 0.0};
-
-    Entity fast; fast.type = EntityType::Hostile;
-    fast.position = {2000.0, 0.0, 0.0};
-    fast.velocity = {-1000.0, 0.0, 0.0};      // 2 s to impact
-    EXPECT_EQ(classifyThreat(fast, asset), ThreatLevel::Critical);
-
-    Entity slow; slow.type = EntityType::Hostile;
-    slow.position = {10000.0, 0.0, 0.0};
-    slow.velocity = {-100.0, 0.0, 0.0};       // 100 s to impact
-    EXPECT_EQ(classifyThreat(slow, asset), ThreatLevel::Low);
-
-    // Friendlies never register as threats.
-    Entity friendly; friendly.type = EntityType::Friendly;
-    friendly.position = {2000.0, 0.0, 0.0};
-    friendly.velocity = {-1000.0, 0.0, 0.0};
-    EXPECT_EQ(classifyThreat(friendly, asset), ThreatLevel::None);
-
-    // Receding hostile is not closing -> no threat.
-    Entity receding; receding.type = EntityType::Hostile;
-    receding.position = {2000.0, 0.0, 0.0};
-    receding.velocity = {500.0, 0.0, 0.0};
-    EXPECT_EQ(classifyThreat(receding, asset), ThreatLevel::None);
-}
 
 TEST(SharedMemory, PublishThenSubscribeRoundTrip) {
     const std::string name = uniqueName("rt");
@@ -140,8 +102,6 @@ TEST(SharedMemory, SeqlockYieldsConsistentSnapshots) {
         std::uint32_t count = 0;
         while (!stop.load(std::memory_order_relaxed)) {
             if (sub.latest(hdr, out.data(), 1024, count)) {
-                // Consistency invariant: every record in a frame carries the
-                // frameId as its entityId and (frameId % 250) as posX.
                 const auto expectX = static_cast<float>(hdr.frameId % 250);
                 bool consistent = true;
                 for (std::uint32_t i = 0; i < count; ++i) {
@@ -171,52 +131,20 @@ TEST(SharedMemory, SeqlockYieldsConsistentSnapshots) {
     EXPECT_GT(reads.load(), 0u) << "reader never observed a frame";
 }
 
-TEST(Udp, SendReceiveRoundTrip) {
-    UdpTelemetryReceiver rx(0); // ephemeral port
-    UdpTelemetrySender tx("127.0.0.1", rx.boundPort());
+TEST(ShmConsumer, PollLatestFrameRoundTrip) {
+    const std::string name = uniqueName("cons");
+    ShmPublisher pub(name);
+    ShmTelemetryConsumer consumer(name);
 
-    FrameHeader hdr{};
-    hdr.magic          = kMagic;
-    hdr.version        = kProtocolVersion;
-    hdr.frameId        = 555;
-    hdr.timestampNs    = 987654321;
-    hdr.recordCount    = 3;
-    hdr.interceptCount = 4;
+    std::vector<TelemetryRecord> recs = {makeRec(4, 40.0f, 3),
+                                         makeRec(5, 50.0f, 4)};
+    pub.publish(11, 222, 6, recs.data(), 2);
 
-    std::vector<TelemetryRecord> recs = {
-        makeRec(10, 11.0f, 4), makeRec(20, 22.0f, 2), makeRec(30, 33.0f, 1)};
-    ASSERT_GT(tx.send(hdr, recs.data(), 3), 0);
-
-    FrameHeader got{};
-    std::vector<TelemetryRecord> out(kUdpMaxRecords);
-    std::uint32_t count = 0;
-    ASSERT_TRUE(rx.receive(got, out.data(), kUdpMaxRecords, count, 2000));
-
-    EXPECT_EQ(got.frameId, 555u);
-    EXPECT_EQ(got.interceptCount, 4u);
-    ASSERT_EQ(count, 3u);
-    EXPECT_EQ(out[0].entityId, 10u);
-    EXPECT_FLOAT_EQ(out[2].posX, 33.0f);
-}
-
-TEST(Udp, OversizeFrameIsClampedToDatagramCapacity) {
-    UdpTelemetryReceiver rx(0);
-    UdpTelemetrySender tx("127.0.0.1", rx.boundPort());
-
-    FrameHeader hdr{};
-    hdr.magic       = kMagic;
-    hdr.version     = kProtocolVersion;
-    hdr.frameId     = 1;
-    hdr.recordCount = 1000; // more than a datagram can carry
-
-    std::vector<TelemetryRecord> recs(1000);
-    for (std::uint32_t i = 0; i < recs.size(); ++i) recs[i].entityId = i;
-    ASSERT_GT(tx.send(hdr, recs.data(), 1000), 0);
-
-    FrameHeader got{};
-    std::vector<TelemetryRecord> out(kUdpMaxRecords);
-    std::uint32_t count = 0;
-    ASSERT_TRUE(rx.receive(got, out.data(), kUdpMaxRecords, count, 2000));
-    EXPECT_EQ(count, kUdpMaxRecords); // clamped, not corrupted
-    EXPECT_EQ(out[0].entityId, 0u);
+    TelemetrySnapshot snap;
+    ASSERT_TRUE(consumer.PollLatestFrame(snap));
+    EXPECT_EQ(snap.header.frameId, 11u);
+    EXPECT_EQ(snap.header.interceptCount, 6u);
+    ASSERT_EQ(snap.records.size(), 2u);
+    EXPECT_EQ(snap.records[1].entityId, 5u);
+    EXPECT_EQ(std::string(consumer.SourceName()), "shm");
 }

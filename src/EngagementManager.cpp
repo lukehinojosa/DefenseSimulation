@@ -103,6 +103,7 @@ void EngagementManager::guide(double dt) {
 int EngagementManager::processDetonations() {
     int hits = 0;
     const double r = config_.fuzeRadius;
+    lastDestroyed_.clear();
 
     for (Interceptor& ic : interceptors_) {
         Entity* self = engine_.entityById(ic.id);
@@ -126,6 +127,8 @@ int EngagementManager::processDetonations() {
                 // Detonation destroys both the interceptor and the threat.
                 self->status   = EntityStatus::Destroyed;
                 target->status = EntityStatus::Destroyed;
+                lastDestroyed_.push_back(self->id);
+                lastDestroyed_.push_back(target->id);
                 ic.targetId    = kNoTarget;
                 ++hits;
                 break;
