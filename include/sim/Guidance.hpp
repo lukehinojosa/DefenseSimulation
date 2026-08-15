@@ -86,6 +86,55 @@ inline Vector3 proNavAcceleration(const Vector3& interceptorPos,
     return relVel.cross(omega) * navConstant;
 }
 
+/**
+ * @brief Apply a commanded acceleration to a velocity with airframe limits.
+ *
+ * Models a missile's inertia: the turn command is capped at @p maxLateralAccel
+ * (its structural/aerodynamic G-limit) so heading cannot change instantly, and
+ * the resulting speed is drawn back toward @p cruiseSpeed no faster than
+ * @p axialAccel (finite thrust/drag). Together these give the round momentum —
+ * it must bleed speed and arc through a turn rather than pivoting like a UFO.
+ */
+inline Vector3 applyAirframeLimits(const Vector3& vel, const Vector3& accelCmd,
+                                   double cruiseSpeed, double maxLateralAccel,
+                                   double axialAccel, double dt) {
+    Vector3 accel = accelCmd;
+    if (accel.magnitudeSquared() > maxLateralAccel * maxLateralAccel) {
+        accel = accel.normalized() * maxLateralAccel;
+    }
+    Vector3 v = vel + accel * dt;
+    const double sp = v.magnitude();
+    if (sp > 1e-6) {
+        const double dvMax = axialAccel * dt;
+        double dv = cruiseSpeed - sp;
+        if (dv >  dvMax) dv =  dvMax;
+        if (dv < -dvMax) dv = -dvMax;
+        v = v * ((sp + dv) / sp);
+    }
+    return v;
+}
+
+/**
+ * @brief Rate-limited pure-pursuit steering toward @p desiredDir.
+ *
+ * Turns @p vel toward the desired heading and converges toward @p cruiseSpeed
+ * under the same airframe limits as applyAirframeLimits(), so a threat pitches
+ * over onto its target gradually instead of snapping direction.
+ */
+inline Vector3 steer(const Vector3& vel, const Vector3& desiredDir,
+                     double cruiseSpeed, double maxLateralAccel,
+                     double axialAccel, double dt) {
+    const Vector3 dd = desiredDir.normalized();
+    if (dd.magnitudeSquared() < 1e-12) {
+        return vel;
+    }
+    // Command whatever acceleration would match the desired velocity this step;
+    // applyAirframeLimits() then caps how much of it the airframe can deliver.
+    const Vector3 accelCmd = (dd * cruiseSpeed - vel) / dt;
+    return applyAirframeLimits(vel, accelCmd, cruiseSpeed, maxLateralAccel,
+                               axialAccel, dt);
+}
+
 } // namespace guidance
 } // namespace sim
 

@@ -23,6 +23,22 @@ enum class EntityStatus : std::uint8_t {
 };
 
 /**
+ * @brief Per-entity behavioral flags (bitmask, stored in Entity::flags).
+ *
+ * These drive the boost/launch phase of a missile: an entity marked
+ * EFLAG_LAUNCHING climbs vertically off its pad and has its steering law
+ * suspended until it clears the hand-off altitude, at which point the flag is
+ * cleared and normal guidance (ProNav for interceptors, ballistic cruise for
+ * threats) resumes. EFLAG_BOOSTING mirrors "motor lit" and is surfaced to the
+ * display as a launch-flame / hot-trail cue.
+ */
+enum EntityFlags : std::uint8_t {
+    EFLAG_NONE      = 0u,
+    EFLAG_LAUNCHING = 1u << 0, ///< Boosting off the pad; guidance suspended.
+    EFLAG_BOOSTING  = 1u << 1  ///< Motor lit (drives launch FX in the display).
+};
+
+/**
  * @brief Bitmask flags for spatial queries so callers can restrict results
  *        to a subset of allegiances (e.g. QUERY_HOSTILE_ONLY).
  *
@@ -53,13 +69,15 @@ constexpr bool typeMatchesFilter(EntityType type, std::uint32_t filter) {
  * telemetry pipeline without serialization overhead.
  */
 struct Entity {
-    EntityId     id{0};
-    Vector3      position{};
-    Vector3      velocity{};
-    EntityType   type{EntityType::Neutral};
-    EntityStatus status{EntityStatus::Active};
+    EntityId      id{0};
+    Vector3       position{};
+    Vector3       velocity{};
+    EntityType    type{EntityType::Neutral};
+    EntityStatus  status{EntityStatus::Active};
+    std::uint8_t  flags{EFLAG_NONE}; ///< EntityFlags bitmask (launch/boost state).
 
-    bool isActive() const { return status == EntityStatus::Active; }
+    bool isActive()  const { return status == EntityStatus::Active; }
+    bool isBoosting() const { return (flags & EFLAG_BOOSTING) != 0u; }
 
     /**
      * @brief Advance the entity by one time step using first-order

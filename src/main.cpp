@@ -8,12 +8,15 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <random>
 #include <string>
 
 #include "sim/EngagementManager.hpp"
+#include "sim/SimConfig.hpp"
 #include "sim/SimulationEngine.hpp"
 
 // Telemetry (shared memory + UDP) is cross-platform.
@@ -21,6 +24,7 @@
 #include <memory>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "sim/SharedMemoryChannel.hpp"
 #include "sim/Telemetry.hpp"
@@ -151,45 +155,147 @@ void runEngagementDemo() {
 // POSIX shared memory for the separate telemetry_monitor process to consume.
 // When udpHost is non-empty it also streams a prioritized subset over UDP for a
 // remote visualizer (e.g. the Windows C2 display over Tailscale).
-void runTelemetryPublisher(double durationSec, const std::string& udpHost,
+void runTelemetryPublisher(const sim::SimConfig& scfg, const std::string& udpHost,
                            std::uint16_t udpPort) {
     namespace tlm = sim::telemetry;
-    const double dt = 1.0 / 60.0;
+    const double dt = 1.0 / 60.0;   // wall-clock frame period (telemetry stays 60 Hz)
+    // Run physics in slow motion: the display still refreshes at 60 Hz, but each
+    // frame advances less simulated time, so fast (Mach 3+) missiles and their
+    // rate-limited turns are legible instead of a 1:1 real-time blur.
+    const double simDt = dt * scfg.timeScale;
 
     sim::SimulationEngine engine(sim::defaultAirspace());
-    sim::EngagementManager::Config cfg;
-    cfg.defendedAsset = {50000.0, 50000.0, 0.0};
-    cfg.fuzeRadius    = 15.0;
+    sim::EngagementManager::Config cfg = scfg.toEngagementConfig();
     sim::EngagementManager mgr(engine, cfg);
 
-    std::mt19937 rng(11);
-    std::uniform_real_distribution<double> jitter(-8000.0, 8000.0);
-    for (int i = 0; i < 24; ++i) {
+    // Threat launch/cruise dynamics (g -> m/s^2). Hostiles boost vertically off
+    // ground sites, then dive on the defended city under a sluggish lateral
+    // limit so they arc over gradually rather than turning on a dime.
+    const double kThreatBoost       = scfg.threatBoostSpeed;
+    const double kThreatCruise      = scfg.threatCruiseSpeed;
+    const double kThreatMaxLatAccel = scfg.threatMaxLatAccelG * sim::SimConfig::kG;
+    const double kThreatAxialAccel  = scfg.threatAxialAccelG * sim::SimConfig::kG;
+
+    std::mt19937 rng(scfg.rngSeed);
+
+    // Hostile salvo: each threat starts on a random bearing at a random range
+    // and a random altitude. Ground launches boost vertically before pitching
+    // over onto the city; ones that spawn already above the hand-off altitude
+    // cruise straight in — a mixed-profile raid rather than a uniform wave.
+    std::uniform_real_distribution<double> bearing(0.0, 2.0 * 3.14159265);
+    std::uniform_real_distribution<double> range(scfg.threatRangeMin,
+                                                 scfg.threatRangeMax);
+    std::uniform_real_distribution<double> height(scfg.threatAltitudeMin,
+                                                  scfg.threatAltitudeMax);
+    for (int i = 0; i < scfg.threatCount; ++i) {
+        const double a = bearing(rng);
+        const double r = range(rng);
         Entity h;
-        // Closer, faster inbound salvo so intercepts resolve within the demo
-        // window (and the intercept counter is visibly exercised in the feed).
-        h.position = {64000.0 + jitter(rng), 64000.0 + jitter(rng),
-                      8000.0 + jitter(rng) * 0.3};
-        h.velocity = (cfg.defendedAsset - h.position).normalized() * 380.0;
+        h.position = {cfg.defendedAsset.x + r * std::cos(a),
+                      cfg.defendedAsset.y + r * std::sin(a), height(rng)};
+        h.velocity = {0.0, 0.0, kThreatBoost}; // straight up off the pad
         h.type     = EntityType::Hostile;
+        h.flags    = sim::EFLAG_LAUNCHING | sim::EFLAG_BOOSTING;
         engine.spawn(h);
     }
-    // Background friendly air traffic so filtering is visible in the feed.
-    for (int i = 0; i < 40; ++i) {
-        Entity f;
-        f.position = {jitter(rng) + 40000.0, jitter(rng) + 40000.0,
-                      6000.0 + jitter(rng) * 0.2};
-        f.velocity = {jitter(rng) * 0.02, jitter(rng) * 0.02, 0.0};
-        f.type     = EntityType::Neutral;
-        engine.spawn(f);
-    }
-    for (int i = 0; i < 24; ++i) {
-        const double a = (2.0 * 3.14159265 * i) / 24.0;
+
+    // Friendly interceptors launch from ground pads on demand rather than in one
+    // mass salvo: a small standing battery fires first, then more rounds ripple
+    // up over time to cover any threat that lacks a shooter. This keeps idle
+    // rounds from boosting straight up with no job to do.
+    std::uniform_real_distribution<double> padAngle(0.0, 2.0 * 3.14159265);
+    const int kMaxFriendly = scfg.friendlyMaxLaunched;
+    int    friendlyLaunched = 0;
+    double launchCooldown   = 0.0;
+    auto launchFriendly = [&]() {
+        const double a = padAngle(rng);
         mgr.deployInterceptor(
-            cfg.defendedAsset +
-                Vector3{8000.0 * std::cos(a), 8000.0 * std::sin(a), 500.0},
-            1200.0);
+            cfg.defendedAsset + Vector3{scfg.friendlyPadRadius * std::cos(a),
+                                        scfg.friendlyPadRadius * std::sin(a), 0.0},
+            scfg.friendlyCruiseSpeed, EntityType::Friendly, /*launching=*/true);
+        ++friendlyLaunched;
+    };
+    for (int i = 0; i < scfg.friendlyStandingBattery; ++i) launchFriendly();
+
+    // Neutral (allied) interceptors stream in from range on random bearings,
+    // well above the deck, each already on an inbound cruise so it flies a
+    // natural approach instead of accelerating from a dead stop before ProNav
+    // takes over. The allegiance matrix lets these non-hostile defenders engage
+    // the same hostile set.
+    std::uniform_real_distribution<double> nbearing(0.0, 2.0 * 3.14159265);
+    std::uniform_real_distribution<double> nrange(scfg.neutralRangeMin,
+                                                  scfg.neutralRangeMax);
+    std::uniform_real_distribution<double> alt(scfg.neutralAltitudeMin,
+                                               scfg.neutralAltitudeMax);
+    for (int i = 0; i < scfg.neutralCount; ++i) {
+        const double a = nbearing(rng);
+        const double r = nrange(rng);
+        const Vector3 pos{cfg.defendedAsset.x + r * std::cos(a),
+                          cfg.defendedAsset.y + r * std::sin(a), alt(rng)};
+        const sim::EntityId id = mgr.deployInterceptor(
+            pos, scfg.neutralCruiseSpeed, EntityType::Neutral, /*launching=*/false);
+        if (Entity* e = engine.entityById(id)) {
+            e->velocity =
+                (cfg.defendedAsset - pos).normalized() * scfg.neutralInboundSpeed;
+        }
     }
+
+    // Per-frame threat director: hostiles boost straight up, then pitch over
+    // and cruise onto the defended asset. The pitch-over is rate-limited, so a
+    // threat arcs from vertical toward its target rather than snapping heading.
+    auto directThreats = [&](double step) {
+        for (Entity& e : engine.entities()) {
+            if (e.type != EntityType::Hostile || !e.isActive()) {
+                continue;
+            }
+            if (e.flags & sim::EFLAG_LAUNCHING) {
+                if (e.position.z >= cfg.launchHandoffAltitude) {
+                    e.flags &= static_cast<std::uint8_t>(
+                        ~(sim::EFLAG_LAUNCHING | sim::EFLAG_BOOSTING));
+                    // fall through to steer this frame
+                } else {
+                    e.velocity = {0.0, 0.0, kThreatBoost};
+                    e.flags |= sim::EFLAG_BOOSTING;
+                    continue;
+                }
+            }
+            e.velocity = sim::guidance::steer(
+                e.velocity, cfg.defendedAsset - e.position, kThreatCruise,
+                kThreatMaxLatAccel, kThreatAxialAccel, step);
+        }
+    };
+
+    // Demand-driven launch controller: ripple up fresh interceptors whenever the
+    // live threat count outpaces the ready shooters, so coverage keeps pace with
+    // the raid (and late leakers still draw a shot) instead of firing one big
+    // salvo up front.
+    auto serviceLaunches = [&](double step) {
+        launchCooldown -= step;
+        int activeHostiles = 0;
+        for (const Entity& e : engine.entities()) {
+            if (e.type == EntityType::Hostile && e.isActive()) ++activeHostiles;
+        }
+        // Count only our OWN (friendly) ready shooters — allied-neutral rounds
+        // are treated as unreliable and are not counted toward coverage. That
+        // way the friendly battery is always sized to neutralize every threat by
+        // itself; any threat an ally happens to kill just frees a friendly to
+        // loiter as a ready reserve (which then backfills if an ally fails).
+        int readyFriendly = 0;
+        for (const auto& ic : mgr.interceptors()) {
+            const Entity* e = engine.entityById(ic.id);
+            if (e != nullptr && e->isActive() &&
+                e->type == EntityType::Friendly && !ic.disposing) {
+                ++readyFriendly;
+            }
+        }
+        // Launch only when a threat has no friendly shooter yet — never fire a
+        // round that would have no target.
+        if (launchCooldown <= 0.0 && friendlyLaunched < kMaxFriendly &&
+            readyFriendly < activeHostiles) {
+            launchFriendly();
+            launchCooldown = scfg.friendlyLaunchCooldown; // stagger the ripple
+        }
+    };
 
     tlm::ShmPublisher publisher(tlm::kDefaultShmName, /*unlinkOnClose=*/true);
     std::vector<tlm::TelemetryRecord> records; // reused; no per-frame alloc
@@ -204,7 +310,9 @@ void runTelemetryPublisher(double durationSec, const std::string& udpHost,
 
     std::cout << "== Telemetry publisher ==\n"
               << "  shm      : " << publisher.name() << "\n"
-              << "  duration : " << durationSec << " s @ 60 Hz\n";
+              << "  duration : " << scfg.durationSeconds << " s @ 60 Hz"
+              << " (time scale " << scfg.timeScale << ")\n"
+              << "  threats  : " << scfg.threatCount << "\n";
     if (udp) {
         std::cout << "  udp      : streaming to " << udpHost << ":" << udpPort
                   << " (top " << tlm::kUdpMaxRecords << " records/frame)\n";
@@ -213,9 +321,11 @@ void runTelemetryPublisher(double durationSec, const std::string& udpHost,
 
     const auto start = std::chrono::steady_clock::now();
     std::uint64_t frameId = 0;
-    const int totalFrames = static_cast<int>(durationSec * 60.0);
+    const int totalFrames = static_cast<int>(scfg.durationSeconds * 60.0);
     for (int f = 0; f < totalFrames; ++f) {
-        mgr.update(dt);
+        directThreats(simDt);   // advance the threat launch/cruise state machine
+        serviceLaunches(simDt); // ripple up interceptors to match the live threat
+        mgr.update(simDt);
 
         // Map interceptor entity id -> assigned target id for LOS lines.
         std::unordered_map<sim::EntityId, sim::EntityId> targetOf;
@@ -229,16 +339,22 @@ void runTelemetryPublisher(double durationSec, const std::string& udpHost,
             std::uint32_t targetId = tlm::kNoTargetId;
             auto it = targetOf.find(e.id);
             if (it != targetOf.end()) targetId = it->second;
+            const std::uint8_t rflags =
+                e.isBoosting() ? tlm::FLAG_BOOSTER : tlm::FLAG_NONE;
             records.push_back(tlm::makeRecord(
-                e, tlm::classifyThreat(e, cfg.defendedAsset), targetId));
+                e, tlm::classifyThreat(e, cfg.defendedAsset), targetId, rflags));
         }
-        // One-frame detonation events so the visualizer can burst FX.
+        // One-frame detonation events so the visualizer can burst FX. Threats
+        // that leaked through and struck the city are tagged as asset losses.
+        std::unordered_set<sim::EntityId> assetLoss(
+            mgr.lastAssetLosses().begin(), mgr.lastAssetLosses().end());
         for (sim::EntityId id : mgr.lastDestroyed()) {
             const Entity* e = engine.entityById(id);
             if (e != nullptr) {
+                std::uint8_t f = tlm::FLAG_DESTROYED;
+                if (assetLoss.count(id) != 0) f |= tlm::FLAG_ASSET_HIT;
                 records.push_back(tlm::makeRecord(*e, tlm::ThreatLevel::None,
-                                                  tlm::kNoTargetId,
-                                                  tlm::FLAG_DESTROYED));
+                                                  tlm::kNoTargetId, f));
             }
         }
 
@@ -279,7 +395,24 @@ void runTelemetryPublisher(double durationSec, const std::string& udpHost,
     }
 
     std::cout << "Telemetry publisher finished: " << frameId << " frames, "
-              << mgr.interceptCount() << " intercepts.\n";
+              << mgr.interceptCount() << " intercepts, "
+              << mgr.assetFailures() << " asset losses.\n";
+}
+
+// Locate the scenario config: $SIM_CONFIG if set, else the first of a few
+// conventional locations that exists (so it resolves whether the binary is run
+// from the repo root or a build subdirectory). Falls back to the default path,
+// where the loader will warn and use built-in defaults.
+std::string resolveConfigPath() {
+    if (const char* env = std::getenv("SIM_CONFIG")) {
+        if (env[0] != '\0') return env;
+    }
+    for (const char* p : {"config/simulation.yaml", "../config/simulation.yaml",
+                          "../../config/simulation.yaml",
+                          "../../../config/simulation.yaml"}) {
+        if (std::ifstream(p).good()) return p;
+    }
+    return "config/simulation.yaml";
 }
 #endif // SIM_HAVE_TELEMETRY
 
@@ -290,11 +423,17 @@ int main(int argc, char** argv) {
 
     if (mode == "telemetry") {
         // Usage: defense_sim telemetry [seconds] [udpHost] [udpPort]
-        const double seconds  = (argc > 2) ? std::stod(argv[2]) : 20.0;
+        // Scenario constants come from config/simulation.yaml (or $SIM_CONFIG);
+        // an optional [seconds] argument overrides the file's duration.
+        std::string usedPath;
+        sim::SimConfig scfg = sim::loadSimConfig(resolveConfigPath(), &usedPath);
+        std::cout << "  config   : "
+                  << (usedPath.empty() ? "(built-in defaults)" : usedPath) << "\n";
+        if (argc > 2) scfg.durationSeconds = std::stod(argv[2]);
         const std::string udp = (argc > 3) ? argv[3] : "";
         const std::uint16_t port =
             (argc > 4) ? static_cast<std::uint16_t>(std::stoi(argv[4])) : 9090;
-        runTelemetryPublisher(seconds, udp, port);
+        runTelemetryPublisher(scfg, udp, port);
         return 0;
     }
 

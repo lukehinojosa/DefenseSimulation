@@ -38,10 +38,13 @@ enum class ThreatLevel : std::uint8_t {
     Critical = 4
 };
 
-/// Per-record status flags (bitmask).
+/// Per-record status flags (bitmask). Only the low 3 bits survive the UDP
+/// codec's packed status byte, so keep new flags within 0b111.
 enum RecordFlags : std::uint8_t {
     FLAG_NONE      = 0u,
-    FLAG_DESTROYED = 1u << 0  ///< Entity was destroyed this frame (detonation).
+    FLAG_DESTROYED = 1u << 0, ///< Entity was destroyed this frame (detonation).
+    FLAG_BOOSTER   = 1u << 1, ///< Motor lit / launch boost phase (hot trail FX).
+    FLAG_ASSET_HIT = 1u << 2  ///< Leaked threat struck the defended city (loss).
 };
 
 #pragma pack(push, 1)

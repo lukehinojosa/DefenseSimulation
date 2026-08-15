@@ -3,8 +3,10 @@
 
 #include <cstdint>
 #include <limits>
+#include <unordered_map>
 #include <vector>
 
+#include "sim/CityLayout.hpp"
 #include "sim/Entity.hpp"
 #include "sim/Guidance.hpp"
 #include "sim/SimulationEngine.hpp"
@@ -15,11 +17,26 @@ namespace sim {
 /// Sentinel meaning "no target currently assigned".
 constexpr EntityId kNoTarget = std::numeric_limits<EntityId>::max();
 
-/// A friendly interceptor flying ProNav guidance against an assigned hostile.
+/**
+ * @brief Engageable-threat mask (allegiance matrix).
+ *
+ * Targeting is expressed as "which allegiances a defender may fire on" rather
+ * than a single hard-coded hostile filter, so both Friendly and Neutral
+ * interceptors can prosecute the same Hostile track set. Today only hostiles
+ * are engageable; widening the alliance is a one-line change here.
+ */
+constexpr std::uint32_t QUERY_ENGAGEABLE_THREATS = FILTER_HOSTILE;
+
+/// An interceptor flying ProNav guidance against an assigned hostile.
 struct Interceptor {
     EntityId id{0};                 ///< Entity id in the SimulationEngine.
     double   cruiseSpeed{0.0};      ///< Steering keeps speed at this value (m/s).
     EntityId targetId{kNoTarget};   ///< Assigned hostile, or kNoTarget.
+    double   fuel{0.0};             ///< Seconds of motor life remaining.
+    bool     disposing{false};      ///< Steering clear to self-detonate safely.
+    int      slot{0};               ///< Deployment index; picks a distinct CAP
+                                    ///< holding altitude/radius so loiterers stack
+                                    ///< instead of piling on one orbit.
 
     bool hasTarget() const { return targetId != kNoTarget; }
 };
@@ -51,6 +68,40 @@ public:
         Vector3 defendedAsset{50000.0, 50000.0, 0.0}; ///< Point threats close on.
         double  fuzeRadius{5.0};                       ///< Proximity fuze (m).
         double  navConstant{guidance::kDefaultNavConstant};
+
+        // --- Airframe limits (inertia / momentum) ---------------------------
+        /// Peak lateral maneuver (m/s^2). ~40 g is typical for a SAM; this caps
+        /// the ProNav turn command so an interceptor cannot pivot instantly.
+        double  maxLateralAccel{40.0 * 9.81};
+        /// Peak thrust/drag along the velocity (m/s^2) used to converge on the
+        /// cruise speed — finite, so speed changes are not instantaneous.
+        double  axialAccel{50.0 * 9.81};
+
+        // --- Ground plane & launch dynamics ---------------------------------
+        double  groundZ{0.0};              ///< World floor; below this is a crash.
+        double  launchHandoffAltitude{1000.0}; ///< Boost until clearing this AGL.
+        double  protectedRadius{6000.0};   ///< Threats grounded within this XY
+                                           ///< range of the asset are losses.
+
+        // --- Interceptor fuel, loiter & safe self-disposal ------------------
+        double  interceptorFuel{70.0};      ///< Seconds of interceptor motor life.
+        double  safeDisposalRadius{12000.0};///< An interceptor that is out of fuel
+                                            ///< steers to at least this XY range
+                                            ///< from the asset and self-detonates,
+                                            ///< clear of the city.
+        double  loiterRadius{12000.0};      ///< A round with no target holds a CAP
+        double  loiterAltitude{6000.0};     ///< orbit at this XY range / altitude
+                                            ///< until a threat needs it (or fuel
+                                            ///< runs out).
+
+        // --- Friendly-on-friendly collision avoidance -----------------------
+        double  separationRadius{600.0};    ///< Begin avoiding a fellow defender
+                                            ///< within this range (m).
+        double  separationAccel{60.0 * 9.81};///< Avoidance authority so interceptors
+                                            ///< never fly through one another.
+        /// Static city structures (skyscrapers/hospital/suburb) as hard
+        /// collision volumes. Empty by default so unit tests see no city.
+        std::vector<CityStructure> city;
     };
 
     explicit EngagementManager(SimulationEngine& engine)
@@ -58,14 +109,31 @@ public:
     EngagementManager(SimulationEngine& engine, Config config)
         : engine_(engine), config_(config) {}
 
-    /// Spawn a friendly interceptor entity at @p pos and register it.
-    EntityId deployInterceptor(const Vector3& pos, double cruiseSpeed) {
+    /**
+     * @brief Spawn an interceptor entity at @p pos and register it.
+     * @param allegiance Friendly or Neutral — both prosecute hostile threats
+     *        (the allegiance matrix lets neutrals defend too).
+     * @param launching  When true the interceptor starts on the ground boosting
+     *        straight up (EFLAG_LAUNCHING) until it clears the hand-off altitude,
+     *        then ProNav takes over. When false it is combat-ready at @p pos with
+     *        zero initial velocity (the original behavior).
+     */
+    EntityId deployInterceptor(const Vector3& pos, double cruiseSpeed,
+                               EntityType allegiance = EntityType::Friendly,
+                               bool launching = false) {
         Entity e;
         e.position = pos;
-        e.velocity = Vector3{};
-        e.type     = EntityType::Friendly;
+        if (launching) {
+            e.velocity = Vector3{0.0, 0.0, cruiseSpeed}; // straight up off the pad
+            e.flags    = EFLAG_LAUNCHING | EFLAG_BOOSTING;
+        } else {
+            e.velocity = Vector3{};
+        }
+        e.type = allegiance;
         const EntityId id = engine_.spawn(e);
-        interceptors_.push_back(Interceptor{id, cruiseSpeed, kNoTarget});
+        const int slot = static_cast<int>(interceptors_.size());
+        interceptors_.push_back(Interceptor{
+            id, cruiseSpeed, kNoTarget, config_.interceptorFuel, false, slot});
         return id;
     }
 
@@ -81,18 +149,47 @@ public:
     /// Run the proximity fuze; returns the number of intercepts this frame.
     int processDetonations();
 
-    /// Full frame: assign -> guide -> step -> detonate.
+    /**
+     * @brief Low-altitude fail-safe: enforce the ground plane and city volumes.
+     *
+     * Any active entity (that is not still boosting off its pad) which has
+     * descended to/through the ground, or entered a static city volume, is
+     * destroyed in place — this is what stops interceptors and leaked threats
+     * from clipping below Z = 0. A hostile grounded on the city or within the
+     * protected radius of the asset is additionally tallied as an asset loss.
+     * @return number of entities removed this frame.
+     */
+    int processGroundAndAssets();
+
+    /**
+     * @brief Self-disposal for interceptors that have finished their job.
+     *
+     * An interceptor with no target left to chase (no engageable threats
+     * remain) or with an empty fuel tank is steered radially away from the
+     * defended zone by guide(); once it is at least Config::safeDisposalRadius
+     * from the asset it self-detonates here, so spent rounds never loiter over
+     * or fall onto the city. @return number self-detonated this frame.
+     */
+    int processInterceptorDisposal();
+
+    /// Full frame: direct launches -> assign -> guide -> step -> detonate ->
+    /// ground/asset fail-safe -> spent-interceptor disposal.
     void update(double dt);
 
     // --- Accessors ---------------------------------------------------------
     const std::vector<Interceptor>& interceptors() const { return interceptors_; }
     int  interceptCount() const { return interceptCount_; }
+    int  assetFailures() const { return assetFailures_; }
     const Config& config() const { return config_; }
 
-    /// Entity ids destroyed during the most recent processDetonations() call
-    /// (interceptor + target pairs). Consumed by the telemetry publisher to
+    /// Entity ids destroyed during the most recent frame (fuze kills plus
+    /// ground/city fail-safe removals). Consumed by the telemetry publisher to
     /// emit one-frame detonation events.
     const std::vector<EntityId>& lastDestroyed() const { return lastDestroyed_; }
+
+    /// Subset of lastDestroyed() that were leaked threats striking the defended
+    /// city/asset this frame (so the display can tag them as asset losses).
+    const std::vector<EntityId>& lastAssetLosses() const { return lastAssetLosses_; }
 
     /// Active interceptors that still have an assigned, living target.
     int activeEngagements() const;
@@ -100,12 +197,22 @@ public:
 private:
     bool isActiveHostile(EntityId id) const;
     void releaseIfTargetLost(Interceptor& ic);
+    /// Repulsion acceleration away from nearby fellow defenders so interceptors
+    /// never collide. Asymmetric via @p priority: @p self only yields to
+    /// higher-priority neighbors, so of any crossing pair exactly one maneuvers
+    /// (the other holds its optimal path). @p selfPriority is @p self's rank.
+    Vector3 separationAccel(const Entity& self, long long selfPriority,
+                            const std::unordered_map<EntityId, long long>&
+                                priority) const;
 
     SimulationEngine&        engine_;
     Config                   config_;
     std::vector<Interceptor> interceptors_;
     std::vector<EntityId>    lastDestroyed_;
+    std::vector<EntityId>    lastAssetLosses_;
     int                      interceptCount_{0};
+    int                      assetFailures_{0};
+    double                   lastDt_{1.0 / 60.0};  ///< Last step, for the swept fuze.
     bool                     primed_{false};
 };
 

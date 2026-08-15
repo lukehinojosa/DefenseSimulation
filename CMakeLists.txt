@@ -106,12 +106,39 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# YAML config (yaml-cpp): prefer an installed package (vcpkg on Windows), and
+# FetchContent-build it from source otherwise (e.g. the Pi). The scenario
+# constants live in config/simulation.yaml and are loaded at runtime.
+# ---------------------------------------------------------------------------
+find_package(yaml-cpp CONFIG QUIET)
+if(NOT yaml-cpp_FOUND AND NOT TARGET yaml-cpp)
+    include(FetchContent)
+    set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        yaml-cpp
+        GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
+        GIT_TAG 0.8.0
+    )
+    FetchContent_MakeAvailable(yaml-cpp)
+    message(STATUS "yaml-cpp: built from source via FetchContent")
+else()
+    message(STATUS "yaml-cpp: using installed package")
+endif()
+# The exported target is namespaced in recent versions and bare in older ones.
+if(TARGET yaml-cpp::yaml-cpp)
+    set(SIM_YAMLCPP yaml-cpp::yaml-cpp)
+else()
+    set(SIM_YAMLCPP yaml-cpp)
+endif()
+
+# ---------------------------------------------------------------------------
 # Demonstration executable
 # ---------------------------------------------------------------------------
-add_executable(defense_sim src/main.cpp)
+add_executable(defense_sim src/main.cpp src/SimConfig.cpp)
 # The "telemetry" publish mode (shm + optional UDP streaming) is now available
 # on every platform.
-target_link_libraries(defense_sim PRIVATE sim_core sim_ipc sim_net)
+target_link_libraries(defense_sim PRIVATE sim_core sim_ipc sim_net ${SIM_YAMLCPP})
 
 # Secondary monitoring process (consumes the shared-memory stream).
 add_executable(telemetry_monitor src/telemetry_monitor.cpp)

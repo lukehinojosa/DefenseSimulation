@@ -99,21 +99,28 @@ The 60 Hz frame budget is 16.7 ms; Phase 1 clears it with room to spare.
 
 - **True Proportional Navigation.** `a_c = N·(V_r × Ω)` with
   `Ω = (R × V_r)/(R·R)`. The command vanishes on a collision course (zero LOS
-  rate) and otherwise nulls the LOS rotation, driving intercept. Interceptors
-  steer at constant cruise speed (the lateral command rotates the velocity
-  vector). Convergence is proven in closed-loop tests against crossing,
-  inbound-3D, and sinusoidally-weaving maneuvering targets for N ∈ {3,4,5}.
+  rate) and otherwise nulls the LOS rotation, driving intercept. Convergence is
+  proven in closed-loop tests against crossing, inbound-3D, and sinusoidally-
+  weaving maneuvering targets for N ∈ {3,4,5}.
+- **Airframe limits (momentum).** The ProNav command is not applied raw: it is
+  capped at the airframe's lateral G-limit (`applyAirframeLimits()`), and speed
+  is drawn toward cruise only as fast as finite thrust/drag allow. So an
+  interceptor *arcs* through a turn and bleeds/gains speed over time instead of
+  pivoting like a UFO — real weight and inertia. Threats pitch over onto target
+  under the same rate limit. Below a working airspeed a round flies pure pursuit
+  to build speed before ProNav lead guidance takes over.
 - **Threat prioritization.** Hostiles are ranked by time-to-impact against the
   defended asset (proximity breaks ties). Targeting queries go through the
-  octree with the `QUERY_HOSTILE_ONLY` bitmask, so friendlies and neutrals
-  never enter a firing solution; interceptors are assigned distinct threats.
-- **Octree proximity fuze.** Each frame a fuze-radius cube around every
-  interceptor is queried for hostiles and confirmed with an exact spherical
-  range test; a hit destroys (despawns) both the interceptor and the threat.
-- **Terminal-phase realism.** Achievable miss distance at a fixed 60 Hz step is
-  bounded by roughly half the per-frame travel, which is why proximity fuzes
-  are radius-sized rather than requiring exact contact — reflected in both the
-  demo and the test tolerances.
+  octree with the `QUERY_ENGAGEABLE_THREATS` mask (an allegiance matrix rather
+  than a hard-coded filter), so any defender — friendly **or** allied-neutral —
+  can prosecute the hostile set while never targeting one another; interceptors
+  are assigned distinct threats.
+- **Swept octree proximity fuze.** Each frame a fuze-box around every
+  interceptor (enlarged by the worst-case per-frame closing travel) is queried
+  for hostiles, then confirmed by the closest approach of the two motion
+  segments over the step — not just the frame-boundary distance. At Mach-3+
+  closing speeds (~30 m per 60 Hz frame) a point test tunnels straight through
+  the target; the swept test catches the fly-through and detonates both bodies.
 
 The demo's 12-vs-12 salvo (Mach-3 interceptors, Mach-1 inbound threats)
 neutralizes all 12 threats, resolving in ~46 s of simulated time.
@@ -210,13 +217,22 @@ Command-and-Control HUD — injecting zero overhead into the engine process.
   events). When the scene exceeds one datagram, the sender keeps the highest
   priority records — detonations, engaged interceptors, then hostiles by threat
   — so the remote view always shows the decisive engagement geometry.
-- **Rendering.** Hostiles (threat-colored) with velocity vectors and trailing
-  ribbons; interceptors (blue idle / green engaged) with heading vectors and
-  ProNav LOS lines to their assigned target; detonations as expanding fading
-  wireframe spheres; a 100×100×20 km grid with the defended asset. The C2 HUD
-  shows active vs. neutralized threats, success rate, and the measured telemetry
+- **Rendering.** Hostiles (threat-colored) with heading darts and trailing
+  ribbons; interceptors (blue/green friendly, dark-green allied-neutral) with heading
+  vectors and ProNav LOS lines to their assigned target; a defended **city** of
+  skyscrapers, a hospital, and a residential suburb as stylized blocks; boosting
+  missiles carry a launch flame and a hot-orange trail that cools to blue on
+  cruise (`flags` bit `FLAG_BOOSTER`); detonations as expanding fading wireframe
+  spheres plus a lingering ground ring. The C2 HUD shows active vs. neutralized
+  threats, **asset losses**, success rate, and the measured telemetry
   rate/throughput. An arcball camera orbits, pans, zooms, and target-tracks
-  individual entities (`Tab`).
+  individual entities (`Tab`); `--dist <units>` frames the opening shot.
+- **Launch dynamics & ground plane.** Threats and interceptors lift off from
+  ground pads (`EFLAG_LAUNCHING`): they boost straight up until clearing a
+  hand-off altitude, then guidance takes over. A low-altitude fail-safe destroys
+  anything that descends through `Z = 0` or into a city volume — which is what
+  keeps tracks from clipping below the ground plane — and tallies leaked threats
+  that strike the city as asset losses.
 
 ### Running
 
@@ -332,6 +348,12 @@ The demo, the telemetry pipeline, and the visualizer all run on **Windows** and
 **Linux**. Paths below assume the MSVC preset on Windows
 (`build/windows-debug/Debug/…`) and a Release build on Linux (`build/…`).
 
+> The engagement scenario is **data-driven**: threat/interceptor counts, speeds,
+> geometry, physics limits, and timing all live in
+> [`config/simulation.yaml`](config/simulation.yaml) and are read at runtime
+> (edit and re-run — no rebuild). Point at a different file with `$SIM_CONFIG`.
+> See [simulation.md](simulation.md) for every key and behavior.
+
 **Simulation demo** (performance + 12-vs-12 engagement):
 
 ```powershell
@@ -387,7 +409,8 @@ another (e.g. Pi → Windows over Tailscale):
 ```
 
 Visualizer controls: drag to orbit, wheel to zoom, `WASD`/`QE` to pan, `Tab` to
-cycle target-tracking, `C` for free camera.
+cycle target-tracking, `C` for free camera. Add `--dist <units>` to set the
+opening zoom (handy for screenshots/CI captures).
 
 > On Windows, the first inbound UDP datagram may be blocked by Windows Defender
 > Firewall — allow the app when prompted, or add a rule for UDP 9090. The local
