@@ -307,6 +307,14 @@ int EngagementManager::processGroundAndAssets() {
     int removed = 0;
     lastAssetLosses_.clear();
 
+    // Build the static-structure broad phase once, the first time we need it.
+    // config_.city is fixed after construction, so a single build is enough; the
+    // grid then answers "inside a building?" in O(1) instead of scanning them all.
+    if (!cityIndexed_) {
+        cityIndex_.build(config_.city);
+        cityIndexed_ = true;
+    }
+
     for (Entity& e : engine_.entities()) {
         if (!e.isActive()) {
             continue;
@@ -322,14 +330,12 @@ int EngagementManager::processGroundAndAssets() {
         const bool hitGround =
             e.position.z <= config_.groundZ && e.velocity.z < 0.0;
 
-        // City contact: inside any static structure volume.
-        bool hitCity = false;
-        for (const CityStructure& s : config_.city) {
-            if (s.box.contains(e.position)) {
-                hitCity = true;
-                break;
-            }
-        }
+        // City contact: inside any static structure volume. A missile that flies
+        // into a building is destroyed regardless of allegiance (interceptors are
+        // launched from batteries outside the protected zone so they never climb
+        // through the skyline); a leaked hostile striking a structure is an asset
+        // loss (tallied below).
+        const bool hitCity = cityIndex_.firstContaining(e.position) != nullptr;
 
         if (!hitGround && !hitCity) {
             continue;

@@ -217,16 +217,28 @@ Command-and-Control HUD — injecting zero overhead into the engine process.
   events). When the scene exceeds one datagram, the sender keeps the highest
   priority records — detonations, engaged interceptors, then hostiles by threat
   — so the remote view always shows the decisive engagement geometry.
-- **Rendering.** Hostiles (threat-colored) with heading darts and trailing
-  ribbons; interceptors (blue/green friendly, dark-green allied-neutral) with heading
-  vectors and ProNav LOS lines to their assigned target; a defended **city** of
-  skyscrapers, a hospital, and a residential suburb as stylized blocks; boosting
-  missiles carry a launch flame and a hot-orange trail that cools to blue on
-  cruise (`flags` bit `FLAG_BOOSTER`); detonations as expanding fading wireframe
-  spheres plus a lingering ground ring. The C2 HUD shows active vs. neutralized
-  threats, **asset losses**, success rate, and the measured telemetry
-  rate/throughput. An arcball camera orbits, pans, zooms, and target-tracks
-  individual entities (`Tab`); `--dist <units>` frames the opening shot.
+- **Rendering.** Hostiles are threat-colored ballistic missiles (body + ogive
+  nose + tail fins) with heading darts and trailing ribbons; interceptors are
+  slender THAAD-class rounds (blue/green friendly, dark-green allied-neutral) with
+  ProNav LOS lines to their assigned target. The defended **city** is the real
+  **United Nations Headquarters and Midtown Manhattan** (Turtle Bay, New York),
+  extruded from **OpenStreetMap building footprints**: the cyan-glass **UN
+  Secretariat** slab is the defended asset, wrapped by the UN campus plaza, the
+  surrounding blocks and towers (Trump World Tower, Turkish House, One/Two UN
+  Plaza, …), and the real **East River** (rasterised from the OSM coastline so
+  only the water is painted — streets never flood). The ~3,100 building footprints
+  are baked into a single static GPU mesh (built once) so the whole skyline is one
+  draw call per frame (~60 FPS). Real proportions are preserved but the map is
+  scaled up uniformly (`kCityScale`) so it spans a **~10 km radius** around the UN
+  and reads against a 20–40 km engagement; the friendly batteries ring
+  the city from *outside* it so interceptors never climb through the buildings.
+  Boosting missiles carry a hot tail plume and a hot-orange trail that
+  cools to blue on cruise (`flags` bit `FLAG_BOOSTER`); detonations are expanding
+  fading fireballs. The C2 HUD shows active vs. neutralized threats, **asset
+  losses**, success rate, and the measured telemetry rate/throughput. An arcball
+  camera orbits, pans, zooms, and target-tracks individual entities (`Tab`);
+  `--dist <units>` frames the opening shot. (Map data © OpenStreetMap
+  contributors, ODbL.)
 - **Launch dynamics & ground plane.** Threats and interceptors lift off from
   ground pads (`EFLAG_LAUNCHING`): they boost straight up until clearing a
   hand-off altitude, then guidance takes over. A low-altitude fail-safe destroys

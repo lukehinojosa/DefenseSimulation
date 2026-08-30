@@ -112,7 +112,7 @@ differ only in how they enter the fight.
 
 | | Friendly | Neutral (allied) |
 | --- | --- | --- |
-| Origin | Ground pads on a **5 km ring** around the asset | Airborne, **~18–22 km** out, random bearing |
+| Origin | Ground batteries on an **11 km ring** — outside the ~9 km city skyline and the 6 km protected zone, so rounds never climb through the buildings | Airborne, **~18–22 km** out, random bearing |
 | Start altitude | 0 (launches) | **2.5–9 km** |
 | Start velocity | Straight up at cruise (`EFLAG_LAUNCHING`) | Inbound cruise toward the asset (**900 m/s**), no boost |
 | Cruise speed | **1300 m/s** | **1400 m/s** |
@@ -247,13 +247,22 @@ threat. The fuze only ever fires interceptor-against-hostile.
 - **Ground fail-safe.** Any active, non-launching entity that descends to/through
   `Z = 0` is destroyed in place (clamped to the deck first). This is what stops
   interceptors and leaked threats from clipping below the ground plane.
-- **Defended city.** A static skyline of **skyscrapers, a hospital, and a
-  residential suburb** (from `CityLayout`) sits around the asset as hard collision
-  volumes. Any entity entering a structure is destroyed.
+- **Defended city.** The **United Nations Headquarters + Midtown Manhattan**
+  (Turtle Bay, New York), built from **real OpenStreetMap building footprints**
+  (`UnMapData.hpp`, generated from OSM; © OpenStreetMap contributors, ODbL). The
+  **UN Secretariat** slab is the defended asset, wrapped by the UN campus plaza
+  and the surrounding blocks and towers (Trump World Tower, Turkish House, One/Two
+  UN Plaza, the Dag Hammarskjöld Library, …). Real proportions are preserved but
+  the whole map (~3,100 real footprints) is scaled up uniformly by `kCityScale`
+  (~5.64×) so it spans a **~10 km radius** around the UN and reads at engagement
+  scale. Each footprint's bounding box is a hard collision volume;
+  **any** missile entering one is destroyed regardless of allegiance — which is
+  why the friendly batteries sit outside the skyline (§5.1), so interceptors never
+  climb through the buildings.
 - **Asset loss.** A **hostile** that grounds within **`protectedRadius` = 6 km**
   of the asset, or strikes a city structure, is tallied as an **asset failure**
-  and flagged `FLAG_ASSET_HIT` so the display can mark the loss. Interceptors that
-  crash simply despawn (no penalty).
+  and flagged `FLAG_ASSET_HIT` so the display can mark the loss. An interceptor
+  that crashes (into the ground or a building) simply despawns (no penalty).
 
 ---
 
@@ -306,13 +315,18 @@ Hostiles are colored by **time-to-impact** on the asset:
 
 | Element | Appearance |
 | --- | --- |
-| Hostile | Threat-colored sphere + red heading dart + trail |
-| Friendly interceptor | Green (engaged) / sky-blue (idle) + heading dart + green LOS line to target |
-| Allied-neutral interceptor | Dark green + LOS line |
-| Boosting round | Orange launch flame; trail runs hot-orange → cool-blue as it transitions to cruise |
-| Detonation | Expanding fading wireframe sphere + lingering ground ring |
-| Defended city | Blue skyscrapers, red hospital, green suburb blocks; teal asset core + battery ring |
+| Hostile | Threat-colored ballistic missile (body + ogive nose + fins) + short red heading dart + trail |
+| Friendly interceptor | Slender THAAD-class missile, green (engaged) / sky-blue (idle) + heading dart + green LOS line to target |
+| Allied-neutral interceptor | Dark-green missile + LOS line |
+| Boosting round | Hot tail plume; trail runs hot-orange → cool-blue as it transitions to cruise |
+| Detonation | Bright flash + expanding fading fireball shell |
+| Defended city | UN HQ + Midtown Manhattan (~3,100 real OSM footprints, one baked GPU mesh, ~10 km radius): cyan-glass Secretariat slab (the asset), blue UN campus plaza, gray blocks, tall towers; the real **East River** (rasterised from the OSM coastline so only the water is painted); battery radius ring |
 | Ground | Solid terrain deck + 100 × 100 km grid + 20 km altitude ceiling wireframe |
+
+Buildings are extruded from real OpenStreetMap footprints, scaled up uniformly
+(`kCityScale`) so the skyline reads against a 20–40 km engagement; missiles keep
+real proportions but are enlarged to stay legible. The default camera frames the
+skyline and the raid together; zoom in to inspect the UN complex.
 
 The C2 HUD reports active hostiles, neutralized count, asset losses, success
 rate, live telemetry rate/throughput, and the current frame id.

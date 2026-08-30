@@ -50,7 +50,9 @@ interceptors:
   friendly:                    # own, ground-launched from the battery
     standing_battery: 8        # rounds fired at t=0.
     max_launched: 40           # hard cap on total friendly launches.
-    pad_radius: 5000.0         # launch-pad ring radius around the asset (m).
+    pad_radius: 11000.0        # battery ring radius (m): outside the ~9 km city
+                               # skyline + 6 km protected zone, so rounds never
+                               # climb up through the buildings.
     cruise_speed: 1300.0
     launch_cooldown: 0.15      # min seconds between demand-driven launches.
 

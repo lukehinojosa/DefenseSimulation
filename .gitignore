@@ -20,3 +20,15 @@ _deps/
 *.a
 *.exe
 *.out
+
+# OSM/DoITT/Overture fetch cache + raw responses (regenerate via the tools/*.py
+# fetch scripts). The baked asset assets/un_map.bin IS committed; its raw inputs
+# are not. tools/tiles/ holds bld_*, part_*, and nyc_* tiles.
+tools/tiles/
+tools/overture_heights.csv
+tools/*.log
+un_coast*.json
+un_buildings*.json
+un_raw.json
+un_water.json
+*_try.json

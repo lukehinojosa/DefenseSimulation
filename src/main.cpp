@@ -16,6 +16,7 @@
 #include <string>
 
 #include "sim/EngagementManager.hpp"
+#include "sim/MapData.hpp"
 #include "sim/SimConfig.hpp"
 #include "sim/SimulationEngine.hpp"
 
@@ -166,6 +167,20 @@ void runTelemetryPublisher(const sim::SimConfig& scfg, const std::string& udpHos
 
     sim::SimulationEngine engine(sim::defaultAirspace());
     sim::EngagementManager::Config cfg = scfg.toEngagementConfig();
+
+    // Load the 1:1 New York map asset and build the collision skyline from the
+    // same instances the visualizer renders (so buildings collide where drawn).
+    sim::MapData map;
+    const std::string mapPath = sim::resolveMapPath();
+    if (sim::loadMapData(mapPath, map)) {
+        cfg.city = sim::cityStructuresFromInstances(map.instances, cfg.defendedAsset,
+                                                    /*scale=*/1.0);
+        std::cout << "  map      : " << mapPath << "  ("
+                  << map.instances.size() << " instances)\n";
+    } else {
+        std::cout << "  map      : <none> (" << mapPath << " failed to load)\n";
+    }
+
     sim::EngagementManager mgr(engine, cfg);
 
     // Threat launch/cruise dynamics (g -> m/s^2). Hostiles boost vertically off

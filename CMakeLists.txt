@@ -21,6 +21,7 @@ add_library(sim_core
     src/Octree.cpp
     src/SimulationEngine.cpp
     src/EngagementManager.cpp
+    src/MapData.cpp
 )
 target_include_directories(sim_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(sim_core PUBLIC Threads::Threads)
@@ -198,6 +199,7 @@ if(SIM_BUILD_TESTS)
         tests/test_entity.cpp
         tests/test_boundingbox.cpp
         tests/test_octree.cpp
+        tests/test_structureindex.cpp
         tests/test_engine.cpp
         tests/test_guidance.cpp
         tests/test_engagement.cpp

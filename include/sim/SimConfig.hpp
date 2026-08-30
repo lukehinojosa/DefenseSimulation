@@ -57,7 +57,7 @@ struct SimConfig {
     // --- Friendly interceptors (ground-launched) ---------------------------
     int    friendlyStandingBattery{8};
     int    friendlyMaxLaunched{40};
-    double friendlyPadRadius{5000.0};
+    double friendlyPadRadius{11000.0}; // batteries outside the city + protected zone
     double friendlyCruiseSpeed{1300.0};
     double friendlyLaunchCooldown{0.15};
 
@@ -86,7 +86,9 @@ struct SimConfig {
         c.loiterAltitude        = loiterAltitude;
         c.separationRadius      = separationRadius;
         c.separationAccel       = separationAccelG * kG;
-        c.city                  = defaultCityLayout(defendedAsset);
+        // c.city is populated by the scenario after loading the map asset (see
+        // main.cpp / cityStructuresFromInstances) so the collision skyline and
+        // the rendered skyline come from the same 1:1 data.
         return c;
     }
 };

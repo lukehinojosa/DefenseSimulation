@@ -10,6 +10,7 @@
 #include "sim/Entity.hpp"
 #include "sim/Guidance.hpp"
 #include "sim/SimulationEngine.hpp"
+#include "sim/StructureIndex.hpp"
 #include "sim/Vector3.hpp"
 
 namespace sim {
@@ -207,6 +208,8 @@ private:
 
     SimulationEngine&        engine_;
     Config                   config_;
+    StructureIndex           cityIndex_;      ///< Broad phase over config_.city.
+    bool                     cityIndexed_{false}; ///< Lazily built on first use.
     std::vector<Interceptor> interceptors_;
     std::vector<EntityId>    lastDestroyed_;
     std::vector<EntityId>    lastAssetLosses_;
