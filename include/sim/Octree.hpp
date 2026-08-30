@@ -2,7 +2,6 @@
 #define SIM_OCTREE_HPP
 
 #include <cstdint>
-#include <memory>
 #include <vector>
 
 #include "sim/BoundingBox.hpp"
@@ -38,6 +37,13 @@ struct OctreeItem {
  * Concurrency model: the tree is built single-writer per frame (or in parallel
  * across disjoint subtrees) and then queried read-only by many threads. It is
  * not internally synchronized for concurrent insert + query.
+ *
+ * Storage: nodes live in one contiguous pool (a std::vector) and reference their
+ * children by index, not by owning pointer. clear() resets a live-node counter
+ * instead of freeing, so the node objects -- and their item-vector capacity --
+ * are reused across frames. This removes the per-frame malloc/free churn of a
+ * pointer-linked tree (the dominant cache-miss source when rebuilding 60x/sec)
+ * and lays the nodes out contiguously for a warmer traversal.
  */
 class Octree {
 public:
@@ -83,36 +89,41 @@ public:
         return out;
     }
 
-    const BoundingBox& bounds() const { return root_->bounds; }
+    const BoundingBox& bounds() const { return nodes_[0].bounds; }
     std::size_t size() const { return count_; }
     bool empty() const { return count_ == 0; }
 
-    /// Total number of allocated nodes; primarily for tests/instrumentation.
+    /// Number of nodes in the current tree; primarily for tests/instrumentation.
     std::size_t nodeCount() const;
 
 private:
+    // A node references its 8 children by pool index (kNone when it is a leaf).
+    static constexpr int kNone = -1;
     struct Node {
         BoundingBox              bounds;
         std::vector<OctreeItem>  items;
-        std::unique_ptr<Node>    children[8];
+        int                      children[8];
         bool                     leaf{true};
-
-        explicit Node(const BoundingBox& b) : bounds(b) {}
     };
 
-    void insertInto(Node& node, const OctreeItem& item, int depth);
-    void subdivide(Node& node);
+    /// Claim a node from the pool (reusing storage), initialised as an empty
+    /// leaf with the given bounds. Returns its pool index. May reallocate the
+    /// pool, so callers must address nodes by index, never by a held reference.
+    int  allocNode(const BoundingBox& b);
+    void insertInto(int nodeIdx, const OctreeItem& item, int depth);
+    void subdivide(int nodeIdx);
     static int octantOf(const Node& node, const Vector3& p);
-    void queryNode(const Node& node,
+    void queryNode(int nodeIdx,
                    const BoundingBox& range,
                    std::uint32_t filter,
                    std::vector<OctreeItem>& out) const;
-    static std::size_t countNodes(const Node& node);
+    std::size_t countNodes(int nodeIdx) const;
 
-    std::unique_ptr<Node> root_;
-    std::size_t           capacity_;
-    int                   maxDepth_;
-    std::size_t           count_{0};
+    std::vector<Node> nodes_;        ///< Contiguous node pool; root is index 0.
+    std::size_t       nodeCount_{0}; ///< Live nodes this frame (<= nodes_.size()).
+    std::size_t       capacity_;
+    int               maxDepth_;
+    std::size_t       count_{0};
 };
 
 } // namespace sim

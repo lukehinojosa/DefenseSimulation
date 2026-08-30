@@ -67,6 +67,13 @@ Everything above builds and runs on both **Windows (MSVC)** and **Linux**.
   exceed capacity and are below a depth cap; coincident points that cannot be
   separated by further subdivision are absorbed rather than dropped or looped
   on. Half-open box bounds keep every point in exactly one octant.
+- **Rebuild without heap churn.** The tree is rebuilt every frame, but its nodes
+  live in one contiguous pool and reference children by index; `clear()` resets a
+  live-node counter instead of freeing, so the node objects and their item-vector
+  capacity are reused frame to frame. Rebuilding 60x/sec therefore does **no
+  per-frame `malloc`/`free`**: profiling a pointer-linked version showed that
+  allocator churn, not the traversal, was the dominant cache-miss source, and
+  pooling roughly halved per-frame time (see Profiling below).
 - **Query correctness is proven, not asserted.** `test_octree.cpp` validates
   200 randomized range queries across every allegiance filter against a brute
   force O(n) reference over 5,000 points.
@@ -80,8 +87,8 @@ Everything above builds and runs on both **Windows (MSVC)** and **Linux**.
 
 | Entities | Per-frame (integrate + octree rebuild) | 60 Hz headroom |
 |---|---|---|
-| 10,000 | ~1.8 ms | ~9x |
-| 50,000 | ~5.6 ms | ~3x |
+| 10,000 | ~0.44 ms | ~37x |
+| 50,000 | ~1.6 ms | ~10x |
 
 The 60 Hz frame budget is 16.7 ms; the engine clears it with room to spare.
 
@@ -353,20 +360,29 @@ valgrind --leak-check=full --error-exitcode=42 ./build/defense_sim telemetry 2
 # ==> ERROR SUMMARY: 0 errors from 0 contexts
 ```
 
-**perf: cache utilization** for 20,000 entities × 60 frames:
+**perf: cache utilization** for 20,000 entities × 60 frames, measured before and
+after moving the octree to a contiguous node pool (see design highlights):
 
 ```bash
 perf stat -e instructions,cycles,cache-references,cache-misses \
           ./build/defense_sim 20000 60
 ```
 
-| Metric | Value |
-|---|---|
-| L1 d-cache miss rate | **3.89%** (≈96% hit rate) |
-| Per-frame time (Pi, 4 cores) | ~12.3 ms, within the 16.7 ms / 60 Hz budget |
+| Metric | Pointer-linked tree | **Node pool** |
+|---|---|---|
+| Per-frame time (Pi, 4 cores) | 12.3 ms | **6.0 ms** |
+| Instructions | 989 M | **433 M** |
+| L1 d-cache accesses | 454 M | 217 M |
+| L1 d-cache misses | 17.7 M | **9.8 M** |
+| L1 d-cache miss rate | 3.9% | 4.5% |
 
-The low miss rate reflects the standard-layout entity array and the octree's
-contiguous per-node item storage.
+Pooling the nodes (reset, don't free, each frame) roughly **halved** per-frame
+time and cut **absolute** L1 misses ~44%. The miss *rate* ticked up because it is
+a ratio: removing the allocator's largely cache-hitting bookkeeping shrank total
+accesses (454 M to 217 M) faster than the misses, leaving the tree traversal and
+the compulsory cold-load of 20k entities as a larger share. Rate is not cost;
+wall-time and total misses both fell sharply, and both remain bounded below by
+those unavoidable cold-loads.
 
 ---
 
