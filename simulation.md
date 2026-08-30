@@ -1,16 +1,15 @@
 # Simulation Behavior Reference
 
-This document describes **what the simulation does** — the world model, the
+This document describes **what the simulation does**: the world model, the
 per-frame update pipeline, and the behavior of every missile and system in it.
 It is a behavioral spec, not an API reference; for build/run instructions see
-[README.md](README.md), and for the phase plan see [Plan.md](Plan.md).
+[README.md](README.md), and for the project roadmap see [Plan.md](Plan.md).
 
 Values in **bold** with units are the current defaults. Where the demo scenario
 (`defense_sim telemetry`) overrides an engine default, both are given.
 
 > **Data-driven.** Every constant that shapes the engagement scenario lives in
-> [`config/simulation.yaml`](config/simulation.yaml) and is read at **runtime** —
-> edit and re-run, no rebuild. The binary reads `$SIM_CONFIG` if set, otherwise
+> [`config/simulation.yaml`](config/simulation.yaml) and is read at **runtime**: edit and re-run, no rebuild. The binary reads `$SIM_CONFIG` if set, otherwise
 > it searches `config/simulation.yaml` and a few parent directories. Any key you
 > omit keeps its built-in default, and a missing file just runs the defaults. See
 > §14 for the full key map.
@@ -22,7 +21,7 @@ Values in **bold** with units are the current defaults. Where the demo scenario
 | Property | Value |
 | --- | --- |
 | Coordinate frame | Right-handed, **X = East, Y = North, Z = Up**, meters |
-| Airspace volume | **100 km × 100 km × 20 km** — `(0,0,0)` to `(100000,100000,20000)` |
+| Airspace volume | **100 km × 100 km × 20 km**: `(0,0,0)` to `(100000,100000,20000)` |
 | Defended asset | Center of the map, **(50000, 50000, 0)** (ground level) |
 | Ground plane | `Z = 0`; nothing may live below it |
 | Frame rate | **60 Hz** fixed step |
@@ -45,8 +44,8 @@ telemetry pipeline.
 | Type | Role |
 | --- | --- |
 | `Hostile` | Inbound threat closing on the defended asset. |
-| `Friendly` | Own interceptor — ground-launched from the battery. |
-| `Neutral` | Allied interceptor — airborne, engages hostiles too. |
+| `Friendly` | Own interceptor, ground-launched from the battery. |
+| `Neutral` | Allied interceptor, airborne, engages hostiles too. |
 
 **Status** (`EntityStatus`): `Active` or `Destroyed` (destroyed entities are
 removed from the spatial index and frozen in place).
@@ -56,7 +55,7 @@ removed from the spatial index and frozen in place).
 | Flag | Meaning |
 | --- | --- |
 | `EFLAG_LAUNCHING` | Boosting straight up off the pad; steering law suspended. |
-| `EFLAG_BOOSTING` | Motor lit — drives the launch-flame / hot-trail display cue. |
+| `EFLAG_BOOSTING` | Motor lit, drives the launch-flame / hot-trail display cue. |
 
 ---
 
@@ -64,14 +63,14 @@ removed from the spatial index and frozen in place).
 
 Each 60 Hz tick of the engagement scenario runs, in order:
 
-1. **`directThreats`** — advance every hostile's launch/cruise state machine.
-2. **`serviceLaunches`** — demand-driven interceptor launches from the pads.
-3. **`assignTargets`** — rank threats and assign them to defenders.
-4. **`guide`** — steer every interceptor (guidance + airframe limits + collision avoidance).
-5. **`engine.step`** — integrate all entities, then rebuild the octree.
-6. **`processDetonations`** — swept proximity fuze (interceptor ↔ hostile).
-7. **`processGroundAndAssets`** — ground-plane and city fail-safe.
-8. **`processInterceptorDisposal`** — spent rounds self-detonate clear of the city.
+1. **`directThreats`**: advance every hostile's launch/cruise state machine.
+2. **`serviceLaunches`**: demand-driven interceptor launches from the pads.
+3. **`assignTargets`**: rank threats and assign them to defenders.
+4. **`guide`**: steer every interceptor (guidance + airframe limits + collision avoidance).
+5. **`engine.step`**: integrate all entities, then rebuild the octree.
+6. **`processDetonations`**: swept proximity fuze (interceptor ↔ hostile).
+7. **`processGroundAndAssets`**: ground-plane and city fail-safe.
+8. **`processInterceptorDisposal`**: spent rounds self-detonate clear of the city.
 
 Ordering matters: threats are steered before the shared integration, and all
 three destruction passes (fuze, ground/city, disposal) run *after* the step so
@@ -89,7 +88,7 @@ the defended asset under a rate-limited turn.
    `EFLAG_LAUNCHING | EFLAG_BOOSTING`, with velocity straight up at
    **`kThreatBoost` = 600 m/s**. Ground launches (altitude 0) boost visibly off
    the deck; ones that spawn already above the hand-off altitude cruise straight
-   in — a mixed-profile raid, not a uniform wave.
+   in, a mixed-profile raid, not a uniform wave.
 2. **Boost.** Climbs vertically until it clears **`launchHandoffAltitude` = 1 km**.
 3. **Pitch-over & cruise.** Clears the launch flags, then each frame steers toward
    the asset at **`kThreatCruise` = 950 m/s** under a sluggish
@@ -112,7 +111,7 @@ differ only in how they enter the fight.
 
 | | Friendly | Neutral (allied) |
 | --- | --- | --- |
-| Origin | Ground batteries on an **11 km ring** — outside the ~9 km city skyline and the 6 km protected zone, so rounds never climb through the buildings | Airborne, **~18–22 km** out, random bearing |
+| Origin | Ground batteries on an **11 km ring**: outside the ~9 km city skyline and the 6 km protected zone, so rounds never climb through the buildings | Airborne, **~18–22 km** out, random bearing |
 | Start altitude | 0 (launches) | **2.5–9 km** |
 | Start velocity | Straight up at cruise (`EFLAG_LAUNCHING`) | Inbound cruise toward the asset (**900 m/s**), no boost |
 | Cruise speed | **1300 m/s** | **1400 m/s** |
@@ -122,7 +121,7 @@ differ only in how they enter the fight.
 1. **Boost (launched rounds only).** Climbs vertically at cruise speed until
    clearing **1 km AGL**, motor lit. Steering is suspended so it rises cleanly.
 2. **Low-speed pursuit.** Below **0.3 × cruise** airspeed (e.g. straight off a
-   standing deployment), flies pure pursuit toward the target to build speed —
+   standing deployment), flies pure pursuit toward the target to build speed,
    ProNav has no velocity to work with from rest.
 3. **Proportional Navigation.** Once flying, guides with true ProNav
    `a_c = N·(V_r × Ω)`, `Ω = (R × V_r)/(R·R)`, `N = 4`. The command nulls the
@@ -137,7 +136,7 @@ mode passes through `applyAirframeLimits`:
 
 - **Lateral G-limit** caps the turn command (**40 g** engine default,
   **55 g** in the demo). The round *arcs* through a turn instead of pivoting
-  instantly — real inertia, no "UFO" snap.
+  instantly, real inertia, no "UFO" snap.
 - **Axial thrust/drag** draws speed toward cruise only as fast as
   `axialAccel` allows (**50 g** default / **60 g** demo), so speed changes are
   gradual, not instantaneous.
@@ -154,7 +153,7 @@ mode passes through `applyAirframeLimits`:
   `assignTargets` hands it a threat.
 - **Self-disposal.** On **fuel exhaustion** the round turns radially away from the
   city (with a slight climb so it never dives on the asset) and self-detonates
-  once it is past **`safeDisposalRadius` = 12 km** — spent rounds never fall on
+  once it is past **`safeDisposalRadius` = 12 km**: spent rounds never fall on
   the city. Disposal is triggered *only* by fuel, never by simply lacking a target
   (that case loiters).
 
@@ -166,12 +165,12 @@ repulsion acceleration (up to **`separationAccel` = 60 g**), folded into pursuit
 loiter, **and** disposal steering through the same airframe limits.
 
 Avoidance is **asymmetric (right-of-way)**. Each frame every interceptor is
-ranked — **attacking (2) > loitering (1) > disposing (0)**, lower entity id
-breaks ties — and a round yields **only to higher-priority neighbors**. So of any
+ranked, **attacking (2) > loitering (1) > disposing (0)**, lower entity id
+breaks ties, and a round yields **only to higher-priority neighbors**. So of any
 crossing pair exactly one maneuvers around the other; an engaged interceptor
 holds its optimal intercept path and is never dragged off-solution by a loiterer.
-(Note: interceptors also cannot *fuze* each other — the proximity fuze is
-hostile-only — so a friendly touch is non-destructive regardless.)
+(Note: interceptors also cannot *fuze* each other, the proximity fuze is
+hostile-only, so a friendly touch is non-destructive regardless.)
 
 ---
 
@@ -180,14 +179,14 @@ hostile-only — so a friendly touch is non-destructive regardless.)
 - **Threat queue.** Active hostiles are ranked most-urgent-first by
   **time-to-impact** (TTI) on the asset, with range breaking ties.
 - **Allegiance matrix.** Targeting uses the `QUERY_ENGAGEABLE_THREATS` mask (=
-  hostiles) rather than a hard-coded friendly filter, so **any** defender —
-  friendly or allied-neutral — can prosecute the same hostile set, and defenders
+  hostiles) rather than a hard-coded friendly filter, so **any** defender,
+  friendly or allied-neutral, can prosecute the same hostile set, and defenders
   never target one another.
 - **Independent claims (don't trust allies).** Friendly and neutral defenders keep
   **separate** claim sets. A friendly engages a threat **even if an ally is
   already on it**, so the friendly battery covers every threat by itself and
   allied intercepts are pure redundancy. Within one allegiance, assignments stay
-  distinct (no two friendlies on one threat, no two allies on one threat) — a
+  distinct (no two friendlies on one threat, no two allies on one threat), a
   threat can carry at most one friendly + one ally.
 - **Retargeting.** Dead targets are dropped at the top of each assignment pass, so
   a round whose threat was neutralized before impact immediately retargets to the
@@ -202,7 +201,7 @@ Interceptors are launched on demand, not in one mass salvo:
 - A small **standing battery** (demo: **8**) fires at the start.
 - Each frame, `serviceLaunches` counts **only friendly** ready shooters (allies
   are treated as unreliable and not counted toward coverage) and launches one
-  more friendly round — **only** when `readyFriendly < activeHostiles`, i.e. a
+  more friendly round, **only** when `readyFriendly < activeHostiles`, i.e. a
   threat still has no friendly shooter. A round is therefore **never launched
   without a target**.
 - Launches are **staggered** (**0.15 s** apart) so the pads fire in a visible
@@ -256,7 +255,7 @@ threat. The fuze only ever fires interceptor-against-hostile.
   the whole map (~3,100 real footprints) is scaled up uniformly by `kCityScale`
   (~5.64×) so it spans a **~10 km radius** around the UN and reads at engagement
   scale. Each footprint's bounding box is a hard collision volume;
-  **any** missile entering one is destroyed regardless of allegiance — which is
+  **any** missile entering one is destroyed regardless of allegiance, which is
   why the friendly batteries sit outside the skyline (§5.1), so interceptors never
   climb through the buildings.
 - **Asset loss.** A **hostile** that grounds within **`protectedRadius` = 6 km**

@@ -20,7 +20,7 @@ constexpr double kDefaultNavConstant = 4.0;
  *     Omega = (R x V_r) / (R . R).
  *
  * On a collision course the bearing to the target is constant, so Omega is
- * the zero vector — the signal ProNav drives to zero.
+ * the zero vector -- the signal ProNav drives to zero.
  */
 inline Vector3 lineOfSightRate(const Vector3& relPos, const Vector3& relVel,
                                double epsilon = 1e-9) {
@@ -92,7 +92,7 @@ inline Vector3 proNavAcceleration(const Vector3& interceptorPos,
  * Models a missile's inertia: the turn command is capped at @p maxLateralAccel
  * (its structural/aerodynamic G-limit) so heading cannot change instantly, and
  * the resulting speed is drawn back toward @p cruiseSpeed no faster than
- * @p axialAccel (finite thrust/drag). Together these give the round momentum —
+ * @p axialAccel (finite thrust/drag). Together these give the round momentum:
  * it must bleed speed and arc through a turn rather than pivoting like a UFO.
  */
 inline Vector3 applyAirframeLimits(const Vector3& vel, const Vector3& accelCmd,

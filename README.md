@@ -5,17 +5,17 @@ interception. Built to demonstrate the low-level engineering that defense
 programs care about: cache-friendly data layout, hand-written spatial math,
 lock-free-style parallelism, and rigorous unit testing.
 
-> **Status:** All four phases complete — core engine + spatial math,
-> closed-loop ProNav guidance with automated engagement, a Linux IPC telemetry
-> pipeline (POSIX shared memory + UDP), and a decoupled Raylib 3D C2 visualizer
-> that consumes either transport through one abstraction. See [`Plan.md`](Plan.md).
+> **Status:** Complete, core engine + spatial math, closed-loop ProNav guidance
+> with automated engagement, a cross-platform IPC telemetry pipeline (POSIX shared
+> memory + UDP), and a decoupled Raylib 3D C2 visualizer that consumes either
+> transport through one abstraction. See [`Plan.md`](Plan.md).
 
 ---
 
 ## Architecture
 
 The simulation runs as one process and streams state to separate, read-only
-display processes — so rendering and monitoring add zero overhead to the engine
+display processes, so rendering and monitoring add zero overhead to the engine
 loop. Consumers depend only on a transport-agnostic interface, so the same
 binaries work over local shared memory or a remote UDP link.
 
@@ -23,10 +23,10 @@ binaries work over local shared memory or a remote UDP link.
 flowchart TB
     subgraph ENGINE["Simulation Engine · defense_sim"]
         direction TB
-        TP["ThreadPool — parallel 60 Hz kinematics"]
-        OCT["Octree — 100×100×20 km spatial index"]
-        GUID["ProNav Guidance — LOS-rate steering"]
-        ENG["Engagement Manager — threat queue · proximity fuze"]
+        TP["ThreadPool: parallel 60 Hz kinematics"]
+        OCT["Octree: 100×100×20 km spatial index"]
+        GUID["ProNav Guidance: LOS-rate steering"]
+        ENG["Engagement Manager: threat queue · proximity fuze"]
         TP --> OCT --> GUID --> ENG
     end
 
@@ -46,7 +46,7 @@ Everything above builds and runs on both **Windows (MSVC)** and **Linux**.
 
 ---
 
-## Phase 1 — Core Engine & Spatial Math
+## Core Engine & Spatial Math
 
 | Deliverable | Where |
 |---|---|
@@ -62,7 +62,7 @@ Everything above builds and runs on both **Windows (MSVC)** and **Linux**.
 
 - **Cache-friendly entities.** `Entity` is a standard-layout, trivially
   copyable aggregate so 10k+ tracks live in a flat contiguous array and can be
-  `memcpy`'d straight into the Phase 3 telemetry pipeline.
+  `memcpy`'d straight into the telemetry pipeline.
 - **Octree that stays correct under stress.** Nodes subdivide only when they
   exceed capacity and are below a depth cap; coincident points that cannot be
   separated by further subdivision are absorbed rather than dropped or looped
@@ -72,7 +72,7 @@ Everything above builds and runs on both **Windows (MSVC)** and **Linux**.
   force O(n) reference over 5,000 points.
 - **Parallelism without locks on the hot path.** The per-frame kinematic update
   partitions the entity array into disjoint chunks across a persistent thread
-  pool, so worker threads never touch overlapping memory — no mutex on the
+  pool, so worker threads never touch overlapping memory, no mutex on the
   update itself. The pool reuses a single completion primitive per batch to
   stay portable across pthread implementations.
 
@@ -83,17 +83,17 @@ Everything above builds and runs on both **Windows (MSVC)** and **Linux**.
 | 10,000 | ~1.8 ms | ~9x |
 | 50,000 | ~5.6 ms | ~3x |
 
-The 60 Hz frame budget is 16.7 ms; Phase 1 clears it with room to spare.
+The 60 Hz frame budget is 16.7 ms; the engine clears it with room to spare.
 
 ---
 
-## Phase 2 — ProNav Guidance & Intercept
+## ProNav Guidance & Intercept
 
 | Deliverable | Where |
 |---|---|
 | Proportional Navigation guidance law + LOS-rate / closing-speed / time-to-go math | [`include/sim/Guidance.hpp`](include/sim/Guidance.hpp) |
 | Automated engagement manager: threat priority queue, target assignment, proximity fuze | [`include/sim/EngagementManager.hpp`](include/sim/EngagementManager.hpp) · [`src/EngagementManager.cpp`](src/EngagementManager.cpp) |
-| ProNav convergence + engagement GTest suites (13 tests) | [`tests/test_guidance.cpp`](tests/test_guidance.cpp) · [`tests/test_engagement.cpp`](tests/test_engagement.cpp) |
+| ProNav convergence + engagement GTest suites (16 tests) | [`tests/test_guidance.cpp`](tests/test_guidance.cpp) · [`tests/test_engagement.cpp`](tests/test_engagement.cpp) |
 
 ### Design highlights
 
@@ -106,19 +106,19 @@ The 60 Hz frame budget is 16.7 ms; Phase 1 clears it with room to spare.
   capped at the airframe's lateral G-limit (`applyAirframeLimits()`), and speed
   is drawn toward cruise only as fast as finite thrust/drag allow. So an
   interceptor *arcs* through a turn and bleeds/gains speed over time instead of
-  pivoting like a UFO — real weight and inertia. Threats pitch over onto target
+  pivoting like a UFO, real weight and inertia. Threats pitch over onto target
   under the same rate limit. Below a working airspeed a round flies pure pursuit
   to build speed before ProNav lead guidance takes over.
 - **Threat prioritization.** Hostiles are ranked by time-to-impact against the
   defended asset (proximity breaks ties). Targeting queries go through the
   octree with the `QUERY_ENGAGEABLE_THREATS` mask (an allegiance matrix rather
-  than a hard-coded filter), so any defender — friendly **or** allied-neutral —
+  than a hard-coded filter), so any defender, friendly **or** allied-neutral,
   can prosecute the hostile set while never targeting one another; interceptors
   are assigned distinct threats.
 - **Swept octree proximity fuze.** Each frame a fuze-box around every
   interceptor (enlarged by the worst-case per-frame closing travel) is queried
   for hostiles, then confirmed by the closest approach of the two motion
-  segments over the step — not just the frame-boundary distance. At Mach-3+
+  segments over the step, not just the frame-boundary distance. At Mach-3+
   closing speeds (~30 m per 60 Hz frame) a point test tunnels straight through
   the target; the swept test catches the fly-through and detonates both bodies.
 
@@ -127,13 +127,13 @@ neutralizes all 12 threats, resolving in ~46 s of simulated time.
 
 ---
 
-## Phase 3 — Linux IPC Telemetry
+## Linux IPC Telemetry
 
 > **Cross-platform.** The shared-memory channel uses **Boost.Interprocess**
 > (POSIX shm on Unix, a native file mapping on Windows), so the publisher,
 > monitor, and `--source shm` visualizer run natively on Windows and Linux
 > alike. Developed/tested on a Raspberry Pi 4 (aarch64, Debian 12) and Windows
-> (MSVC). Boost is header-only here — from `libboost-dev` (apt) or vcpkg.
+> (MSVC). Boost is header-only here, from `libboost-dev` (apt) or vcpkg.
 
 | Deliverable | Where |
 |---|---|
@@ -154,7 +154,7 @@ neutralizes all 12 threats, resolving in ~46 s of simulated time.
   a per-slot sequence counter (odd = writing). Readers snapshot the latest slot
   and re-check the counter; with ring depth ≥ 3 the writer has always moved on,
   so reads never tear. Cross-process atomics are `static_assert`-ed lock-free.
-  **No allocation occurs on the publish path** — records are `memcpy`-ed
+  **No allocation occurs on the publish path**: records are `memcpy`-ed
   straight into the mapping. The mapping is created with Boost.Interprocess,
   specialized per platform: `windows_shared_memory` (native `CreateFileMapping`,
   kernel-reclaimed) on Windows, `shared_memory_object` (`shm_open`) on POSIX.
@@ -163,11 +163,11 @@ neutralizes all 12 threats, resolving in ~46 s of simulated time.
   zig-zag + variable-length-quantity integers, positions quantized to meters and
   velocities to m/s, allegiance/threat/flags packed into one byte. That drops a
   record to ~12–15 B and lets the sender greedily pack the highest-priority
-  tracks that fit a single datagram — so the **entire scene** now travels in one
+  tracks that fit a single datagram, so the **entire scene** now travels in one
   packet, where the raw layout capped a datagram at ~40 tracks.
 - **Decoupled monitor process.** `telemetry_monitor` is a pure consumer: it
   attaches read-only and reports live threat tallies, intercept count, and the
-  measured telemetry frame rate — the command-and-display process from the
+  measured telemetry frame rate, the command-and-display process from the
   architecture diagram.
 - **UDP transport.** A single datagram carries a codec-encoded frame (see the
   binary codec above), kept under a typical MTU; when a scene is too large the
@@ -176,23 +176,24 @@ neutralizes all 12 threats, resolving in ~46 s of simulated time.
 ### Running the pipeline (two terminals)
 
 ```bash
-# Terminal 1 — run the sim, publishing telemetry to defsim_telemetry for 20 s
+# Terminal 1: run the sim, publishing telemetry to defsim_telemetry for 20 s
 ./build/defense_sim telemetry 20
 
-# Terminal 2 — attach the monitor
+# Terminal 2: attach the monitor
 ./build/telemetry_monitor
 ```
 
 ---
 
-## Phase 4 — Decoupled 3D C2 Visualizer (Raylib)
+## Decoupled 3D C2 Visualizer (Raylib)
 
 > **Optional target.** Off by default (`-DSIM_BUILD_VISUALIZER=ON` to enable),
-> so headless servers and CI still build Phases 1–3 without a graphics stack.
+> so headless servers and CI still build the engine, telemetry, and tests
+> without a graphics stack.
 
-A standalone, read-only 3D tactical display that consumes the Phase 3 telemetry
+A standalone, read-only 3D tactical display that consumes the telemetry
 and renders the airspace, tracks, ProNav intercept geometry, detonations, and a
-Command-and-Control HUD — injecting zero overhead into the engine process.
+Command-and-Control HUD, injecting zero overhead into the engine process.
 
 | Deliverable | Where |
 |---|---|
@@ -210,13 +211,13 @@ Command-and-Control HUD — injecting zero overhead into the engine process.
   over shared memory or on a Windows PC over UDP/Tailscale.
 - **Fully cross-platform.** The UDP layer (`sim_net`) compiles against POSIX
   sockets on Linux and Winsock2 on Windows, and the shared-memory channel uses
-  Boost.Interprocess — so the engine, both transports, and the display all run
+  Boost.Interprocess, so the engine, both transports, and the display all run
   natively on either OS.
 - **Bandwidth-aware remote feed.** Telemetry protocol **v2** adds a per-record
   `targetId` (interceptor→hostile LOS lines) and a `flags` byte (detonation
   events). When the scene exceeds one datagram, the sender keeps the highest
-  priority records — detonations, engaged interceptors, then hostiles by threat
-  — so the remote view always shows the decisive engagement geometry.
+  priority records, detonations, engaged interceptors, then hostiles by threat,
+  so the remote view always shows the decisive engagement geometry.
 - **Rendering.** Hostiles are threat-colored ballistic missiles (body + ogive
   nose + tail fins) with heading darts and trailing ribbons; interceptors are
   slender THAAD-class rounds (blue/green friendly, dark-green allied-neutral) with
@@ -226,25 +227,36 @@ Command-and-Control HUD — injecting zero overhead into the engine process.
   Secretariat** slab is the defended asset, wrapped by the UN campus plaza, the
   surrounding blocks and towers (Trump World Tower, Turkish House, One/Two UN
   Plaza, …), and the real **East River** (rasterised from the OSM coastline so
-  only the water is painted — streets never flood). The ~3,100 building footprints
-  are baked into a single static GPU mesh (built once) so the whole skyline is one
-  draw call per frame (~60 FPS). Real proportions are preserved but the map is
-  scaled up uniformly (`kCityScale`) so it spans a **~10 km radius** around the UN
-  and reads against a 20–40 km engagement; the friendly batteries ring
-  the city from *outside* it so interceptors never climb through the buildings.
+  only the water is painted, streets never flood). The map is rendered at **true
+  1:1 scale** (`kScale`: 1 world unit = 1 km) at each building's **real height**, spanning a **~10 km radius** around the UN and reading against a 20–40 km
+  engagement. Its **~485,000 building instances** are drawn by **flyweight
+  instancing**: two shared base meshes (box + cylinder) whose per-instance
+  transforms are uploaded to persistent GPU buffers once, so the whole skyline is
+  one instanced draw call per building class per frame (with optional
+  view-frustum culling), the ~485k-instance metro holds ~60 FPS. The friendly
+  batteries ring the city from *outside* it, and interceptor guidance
+  terrain-follows the skyline, so rounds never fly through the buildings.
   Boosting missiles carry a hot tail plume and a hot-orange trail that
   cools to blue on cruise (`flags` bit `FLAG_BOOSTER`); detonations are expanding
   fading fireballs. The C2 HUD shows active vs. neutralized threats, **asset
   losses**, success rate, and the measured telemetry rate/throughput. An arcball
-  camera orbits, pans, zooms, and target-tracks individual entities (`Tab`);
-  `--dist <units>` frames the opening shot. (Map data © OpenStreetMap
+  camera orbits, pans, and zooms; **hovering** a missile rings and labels it
+  (`ENEMY` / `ALLY` / `DOMESTIC`), **left-clicking** locks the camera to follow
+  that round (orbit then rotates about it; `Esc`/`C` release), and `Tab` cycles
+  live tracks. `--dist <units>` frames the opening shot. (Map data © OpenStreetMap
   contributors, ODbL.)
-- **Launch dynamics & ground plane.** Threats and interceptors lift off from
-  ground pads (`EFLAG_LAUNCHING`): they boost straight up until clearing a
-  hand-off altitude, then guidance takes over. A low-altitude fail-safe destroys
-  anything that descends through `Z = 0` or into a city volume — which is what
-  keeps tracks from clipping below the ground plane — and tallies leaked threats
-  that strike the city as asset losses.
+- **Terrain-following guidance & ground plane.** Threats and interceptors lift
+  off from ground pads (`EFLAG_LAUNCHING`), boosting straight up to a hand-off
+  altitude before guidance takes over. Interceptors then fly pure ProNav for the
+  intercept, with a **decoupled terrain floor** layered onto the result so it
+  never distorts the collision course: a descent-rate cap that can never cross
+  the local floor plus an active climb up to it. The floor follows the **real
+  building heights**, a lookahead skyline query over the city grid
+  ([`StructureIndex`](include/sim/StructureIndex.hpp)), so a round levels off
+  above the buildings instead of chasing a city-bound threat down into them. No
+  interceptor flies into the ground or the skyline (0 terrain losses over a
+  100-threat salvo), while a leaked threat that strikes the city is destroyed and
+  tallied as an asset loss.
 
 ### Running
 
@@ -265,24 +277,28 @@ c2_visualizer.exe --source udp --port 9090
 ## Building
 
 Requires CMake 3.20+, a C++17 compiler, and **Boost** (header-only
-Boost.Interprocess) — from `libboost-dev` on Debian/Ubuntu, or vcpkg on Windows
+Boost.Interprocess), from `libboost-dev` on Debian/Ubuntu, or vcpkg on Windows
 (`vcpkg install boost-interprocess`; the Windows presets point at the vcpkg
 toolchain). GoogleTest (and, for the visualizer, Raylib 5.5) are fetched
 automatically via CMake `FetchContent` (needs network access on first
 configure).
 
-### CMake Presets (recommended — one CLion profile builds everything)
+### CMake Presets (recommended: one CLion profile builds everything)
 
 [`CMakePresets.json`](CMakePresets.json) defines ready-made profiles. In CLion
-they appear directly as profiles; pick **Windows x64 Debug (MSVC)** and every
-target — engine, tests, and the `c2_visualizer` — builds under MSVC in a single
+they appear directly as profiles; pick **Windows x64 Release (MSVC)** and every
+target, engine, tests, and the `c2_visualizer`, builds under MSVC in a single
 profile. From the command line:
 
 ```bash
-cmake --preset windows-debug          # MSVC, Visual Studio generator, viz ON
-cmake --build build/windows-debug --config Debug
-ctest --preset windows-debug          # 47 tests (Phases 1-2 + protocol/UDP)
+cmake --preset windows-release        # MSVC, Visual Studio generator, viz ON
+cmake --build build/windows-release --config Release
+ctest --preset windows-release        # 61 tests (engine, guidance, engagement, IPC/UDP, collision index)
 ```
+
+> The Visual Studio generator is multi-config, so pass `--config Release`
+> explicitly, a bare `cmake --build` defaults to Debug and lands the binaries in
+> `build/windows-release/Debug/` instead of `Release/`.
 
 Presets: `windows-debug` / `windows-release` (MSVC, visualizer on),
 `linux-release` (Pi/WSL, full IPC + visualizer), `linux-headless` (no
@@ -316,7 +332,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSIM_BUILD_VISUALIZER=ON
 cmake --build build --target c2_visualizer -j
 ```
 
-Raylib resolves from an installed package first (`find_package(raylib)` — e.g.
+Raylib resolves from an installed package first (`find_package(raylib)`, e.g.
 `vcpkg install raylib` on Windows, which provides a matching header + lib + DLL),
 and falls back to building from source via `FetchContent` (raylib 5.5) when none
 is installed. On Linux, source builds need the usual X11/GL dev packages (e.g.
@@ -328,7 +344,7 @@ on the Pi, and runs natively on Windows/MSVC.
 
 Verified on a Raspberry Pi 4 (Cortex-A72, 4 cores, Debian 12).
 
-**Valgrind — zero leaks** across the engine, thread pool, octree, engagement
+**Valgrind: zero leaks** across the engine, thread pool, octree, engagement
 manager, and the Boost.Interprocess shared-memory publisher:
 
 ```bash
@@ -337,7 +353,7 @@ valgrind --leak-check=full --error-exitcode=42 ./build/defense_sim telemetry 2
 # ==> ERROR SUMMARY: 0 errors from 0 contexts
 ```
 
-**perf — cache utilization** for 20,000 entities × 60 frames:
+**perf: cache utilization** for 20,000 entities × 60 frames:
 
 ```bash
 perf stat -e instructions,cycles,cache-references,cache-misses \
@@ -347,7 +363,7 @@ perf stat -e instructions,cycles,cache-references,cache-misses \
 | Metric | Value |
 |---|---|
 | L1 d-cache miss rate | **3.89%** (≈96% hit rate) |
-| Per-frame time (Pi, 4 cores) | ~12.3 ms — within the 16.7 ms / 60 Hz budget |
+| Per-frame time (Pi, 4 cores) | ~12.3 ms, within the 16.7 ms / 60 Hz budget |
 
 The low miss rate reflects the standard-layout entity array and the octree's
 contiguous per-node item storage.
@@ -357,20 +373,20 @@ contiguous per-node item storage.
 ## Running
 
 The demo, the telemetry pipeline, and the visualizer all run on **Windows** and
-**Linux**. Paths below assume the MSVC preset on Windows
-(`build/windows-debug/Debug/…`) and a Release build on Linux (`build/…`).
+**Linux**. Paths below assume the MSVC Release preset on Windows
+(`build/windows-release/Release/…`) and a Release build on Linux (`build/…`).
 
 > The engagement scenario is **data-driven**: threat/interceptor counts, speeds,
 > geometry, physics limits, and timing all live in
 > [`config/simulation.yaml`](config/simulation.yaml) and are read at runtime
-> (edit and re-run — no rebuild). Point at a different file with `$SIM_CONFIG`.
+> (edit and re-run, no rebuild). Point at a different file with `$SIM_CONFIG`.
 > See [simulation.md](simulation.md) for every key and behavior.
 
 **Simulation demo** (performance + 12-vs-12 engagement):
 
 ```powershell
 # Windows
-.\build\windows-debug\Debug\defense_sim.exe 10000 60
+.\build\windows-release\Release\defense_sim.exe 10000 60
 ```
 
 ```bash
@@ -378,13 +394,13 @@ The demo, the telemetry pipeline, and the visualizer all run on **Windows** and
 ./build/defense_sim 10000 60
 ```
 
-**Telemetry pipeline** — publisher + separate monitor over shared memory (two
+**Telemetry pipeline**: publisher + separate monitor over shared memory (two
 terminals):
 
 ```powershell
 # Windows
-.\build\windows-debug\Debug\defense_sim.exe telemetry 30    # terminal 1
-.\build\windows-debug\Debug\telemetry_monitor.exe           # terminal 2
+.\build\windows-release\Release\defense_sim.exe telemetry 30    # terminal 1
+.\build\windows-release\Release\telemetry_monitor.exe           # terminal 2
 ```
 
 ```bash
@@ -393,12 +409,12 @@ terminals):
 ./build/telemetry_monitor
 ```
 
-**3D C2 visualizer** — local over shared memory:
+**3D C2 visualizer**: local over shared memory:
 
 ```powershell
 # Windows (terminal 1, then terminal 2)
-.\build\windows-debug\Debug\defense_sim.exe telemetry 60
-.\build\windows-debug\Debug\c2_visualizer.exe --source shm
+.\build\windows-release\Release\defense_sim.exe telemetry 60
+.\build\windows-release\Release\c2_visualizer.exe --source shm
 ```
 
 ```bash
@@ -411,21 +427,23 @@ terminals):
 another (e.g. Pi → Windows over Tailscale):
 
 ```bash
-# engine host — stream to the display's IP
+# engine host: stream to the display's IP
 ./build/defense_sim telemetry 60 <display-ip> 9090
 ```
 
 ```powershell
 # display host (Windows)
-.\build\windows-debug\Debug\c2_visualizer.exe --source udp --port 9090
+.\build\windows-release\Release\c2_visualizer.exe --source udp --port 9090
 ```
 
 Visualizer controls: drag to orbit, wheel to zoom, `WASD`/`QE` to pan, `Tab` to
-cycle target-tracking, `C` for free camera. Add `--dist <units>` to set the
-opening zoom (handy for screenshots/CI captures).
+cycle tracks, `C`/`Esc` for free camera. **Hover** a missile to identify it, a
+ring in its allegiance color tagged `ENEMY` / `ALLY` / `DOMESTIC`; **left-click**
+to lock the camera onto that round (orbit then rotates about it, `Esc` releases).
+Add `--dist <units>` to set the opening zoom (handy for screenshots/CI captures).
 
 > On Windows, the first inbound UDP datagram may be blocked by Windows Defender
-> Firewall — allow the app when prompted, or add a rule for UDP 9090. The local
+> Firewall, allow the app when prompted, or add a rule for UDP 9090. The local
 > shared-memory path needs no firewall changes.
 
 ---
@@ -438,7 +456,7 @@ include/sim/   Public headers (math, entities, octree, thread pool, engine,
 src/           Implementation + executables: defense_sim, telemetry_monitor,
                c2_visualizer
 tests/         GoogleTest suites (one per component)
-Plan.md        Full four-phase roadmap
+Plan.md        Full project roadmap
 ```
 
 **Targets by platform.** Everything is cross-platform. `sim_core` (engine),
@@ -451,6 +469,6 @@ headless/CI builds free of a graphics stack.
 
 ## Target environment
 
-Written to be portable C++17. The reference target for later phases is
-Linux (Ubuntu 22.04 / RHEL), where Phase 3 adds POSIX shared-memory and UDP
+Written to be portable C++17. The reference target is
+Linux (Ubuntu 22.04 / RHEL), where the IPC layer adds POSIX shared-memory and UDP
 telemetry and the project is profiled with Valgrind and `perf`.

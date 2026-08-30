@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "raylib.h"
@@ -408,6 +409,23 @@ Color threatColor(std::uint8_t level) {
     }
 }
 
+// The representative color of a track (matches its rendered silhouette), used
+// for the hover ring.
+Color trackColor(const TelemetryRecord& r) {
+    if (isHostile(r)) return threatColor(r.threatLevel);
+    const bool engaged = r.targetId != kNoTargetId;
+    if (isNeutral(r)) return engaged ? Color{30, 130, 50, 255} : Color{22, 95, 38, 255};
+    return engaged ? GREEN : SKYBLUE; // friendly
+}
+
+// The hover-ring allegiance label: our own battery rounds are DOMESTIC, allied
+// airborne interceptors are ALLY, inbound threats are ENEMY.
+const char* trackLabel(const TelemetryRecord& r) {
+    if (isHostile(r))  return "ENEMY";
+    if (isNeutral(r))  return "ALLY";
+    return "DOMESTIC";
+}
+
 // --- CLI parsing -------------------------------------------------------------
 struct Options {
     std::string source{"shm"};
@@ -461,6 +479,9 @@ int main(int argc, char** argv) {
     InitWindow(screenW, screenH, "Defense Simulation - C2 Tactical Display");
     SetWindowMinSize(800, 480);
     SetTargetFPS(60);
+    // ESC is repurposed to end camera-follow, so disable raylib's default
+    // "ESC closes the window" behaviour (the window's close button still quits).
+    SetExitKey(KEY_NULL);
 
     // All UI text uses Roboto (found next to the other assets); DrawTextEx via the
     // DT() helper below. Falls back to raylib's built-in font if the file is absent.
@@ -507,6 +528,7 @@ int main(int argc, char** argv) {
     if (opt.distance > 0.0f) cam.distance = Clamp(opt.distance, 1.0f, 400.0f);
     TelemetrySnapshot snap;
     std::unordered_map<std::uint32_t, std::deque<TrailPt>> trails;
+    std::unordered_map<std::uint32_t, double> trailSeen; // wall-clock last update
     std::vector<Detonation> detonations;
 
     // Static defended city: the real UN HQ + Midtown Manhattan, loaded 1:1 from
@@ -711,7 +733,14 @@ int main(int argc, char** argv) {
     double telemetryFps = 0.0;
     double throughputKBs = 0.0;
 
-    int trackIndex = -1; // -1 = free camera; otherwise index into trackables
+    // Camera follow: the entity id the camera is chasing (-1 = free camera).
+    // Set by Tab-cycling the trackables list or by left-clicking a missile;
+    // cleared by [C]/[Esc] or when the followed track leaves the scene.
+    long long followId = -1;
+    // Left-button click-vs-drag disambiguation: a press that releases without
+    // moving far is a pick (select a missile); a moving press orbits the camera.
+    Vector2 pressPos{0.0f, 0.0f};
+    float    pressDrag = 0.0f;
     int neutralizedPeak = 0;
     int assetLosses = 0; // leaked threats that struck the city (running total)
     int frameCounter = 0;
@@ -730,6 +759,29 @@ int main(int argc, char** argv) {
     int   cityTotal = 0, cityDrawn = 0, cityLod = 0;
     for (int k = 0; k < 5; ++k)
         for (int p = 0; p < 2; ++p) cityTotal += static_cast<int>(groups[k][p].xform.size());
+
+    // Return the index into snap.records of the missile whose projected screen
+    // position is nearest `sp` and within `maxPx` pixels, or -1. Points behind
+    // the camera are rejected (a world point behind the eye projects to a bogus
+    // on-screen location).
+    auto pickNearestMissile = [&](Vector2 sp, float maxPx) -> int {
+        const Camera3D c3 = cam.toCamera();
+        const Vector3 fwd = Vector3Normalize(Vector3Subtract(c3.target, c3.position));
+        int best = -1;
+        float bestD2 = maxPx * maxPx;
+        for (int i = 0; i < static_cast<int>(snap.records.size()); ++i) {
+            const TelemetryRecord& r = snap.records[i];
+            if (r.flags & FLAG_DESTROYED) continue;
+            if (!isHostile(r) && !isInterceptor(r)) continue;
+            const Vector3 wp = recPos(r);
+            if (Vector3DotProduct(Vector3Subtract(wp, c3.position), fwd) <= 0.0f)
+                continue; // behind the camera
+            const Vector2 s = GetWorldToScreen(wp, c3);
+            const float dx = s.x - sp.x, dy = s.y - sp.y, d2 = dx * dx + dy * dy;
+            if (d2 < bestD2) { bestD2 = d2; best = i; }
+        }
+        return best;
+    };
 
     while (!WindowShouldClose()) {
         // Track the live window size so the HUD/panel and 3D aspect follow resizes;
@@ -757,49 +809,112 @@ int main(int argc, char** argv) {
             neutralizedPeak = std::max<int>(
                 neutralizedPeak, static_cast<int>(snap.header.interceptCount));
 
-            // Update trails and spawn detonation FX from this frame.
+            // Update trails and spawn detonation FX from this frame, collecting
+            // the ids still live this frame so we can prune orphaned trails below.
+            std::unordered_set<std::uint32_t> present;
+            present.reserve(snap.records.size());
+            const double now = GetTime();
             for (const auto& r : snap.records) {
                 if (r.flags & FLAG_DESTROYED) {
                     detonations.push_back(Detonation{recPos(r), 0.0f});
                     trails.erase(r.entityId);
+                    trailSeen.erase(r.entityId);
                     if (r.flags & FLAG_ASSET_HIT) ++assetLosses;
                     continue;
                 }
+                present.insert(r.entityId);
                 auto& tr = trails[r.entityId];
                 tr.push_back(TrailPt{recPos(r), isBooster(r)});
                 if (tr.size() > 60) tr.pop_front();
+                trailSeen[r.entityId] = now;
+            }
+
+            // Prune trails for any entity that is no longer in the frame. Relying
+            // on catching a track's one-frame FLAG_DESTROYED record leaks its trail
+            // whenever that frame is dropped -- PollLatestFrame only ever returns
+            // the newest snapshot, and under load (e.g. two rounds detonating on the
+            // same frame) the destroy frame is easily skipped, stranding the plume
+            // forever. An entity absent from the latest frame is gone, so drop it.
+            for (auto it = trails.begin(); it != trails.end();) {
+                if (present.count(it->first) == 0) {
+                    trailSeen.erase(it->first);
+                    it = trails.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
 
-        // --- Trackable set (hostiles then interceptors) for target-follow -----
+        // Hard "forever" guard, independent of fresh frames: drop any trail not
+        // refreshed within a short wall-clock window. Catches the case the
+        // per-frame prune cannot -- the producer stalling or the run ending, which
+        // otherwise freezes every in-flight plume on screen indefinitely.
+        {
+            constexpr double kTrailTtl = 1.5; // seconds without an update -> drop
+            const double now = GetTime();
+            for (auto it = trails.begin(); it != trails.end();) {
+                const auto s = trailSeen.find(it->first);
+                if (s == trailSeen.end() || now - s->second > kTrailTtl) {
+                    if (s != trailSeen.end()) trailSeen.erase(s);
+                    it = trails.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // --- Trackable set (hostiles then interceptors) for Tab-cycling -------
         std::vector<std::uint32_t> trackables;
         for (const auto& r : snap.records)
             if (isHostile(r) && !(r.flags & FLAG_DESTROYED)) trackables.push_back(r.entityId);
         for (const auto& r : snap.records)
             if (isInterceptor(r) && r.targetId != kNoTargetId) trackables.push_back(r.entityId);
 
-        if (IsKeyPressed(KEY_TAB)) {
-            if (trackables.empty()) trackIndex = -1;
-            else trackIndex = (trackIndex + 1) % static_cast<int>(trackables.size());
+        // Left-click to follow the missile under the cursor; a press that drags is
+        // an orbit, not a pick, so only release-without-drag selects. Clicking a
+        // missile zooms the camera in on it; empty space leaves the view alone.
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            pressPos = GetMousePosition();
+            pressDrag = 0.0f;
         }
-        if (IsKeyPressed(KEY_C)) trackIndex = -1; // free camera
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+            pressDrag = std::max(pressDrag,
+                                 Vector2Distance(GetMousePosition(), pressPos));
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && pressDrag < 6.0f) {
+            const int hit = pickNearestMissile(pressPos, 32.0f);
+            if (hit >= 0) {
+                followId = static_cast<long long>(snap.records[hit].entityId);
+                cam.distance = 3.0f; // zoom in on the selected missile
+            }
+        }
+
+        if (IsKeyPressed(KEY_TAB)) {
+            if (trackables.empty()) followId = -1;
+            else {
+                int cur = -1;
+                for (int i = 0; i < static_cast<int>(trackables.size()); ++i)
+                    if (static_cast<long long>(trackables[i]) == followId) { cur = i; break; }
+                followId = static_cast<long long>(
+                    trackables[(cur + 1) % static_cast<int>(trackables.size())]);
+            }
+        }
+        if (IsKeyPressed(KEY_C) || IsKeyPressed(KEY_ESCAPE)) followId = -1; // free camera
         if (IsKeyPressed(KEY_F)) frustumCull = !frustumCull;
         if (IsKeyPressed(KEY_P)) depthPrepass = !depthPrepass;
         if (IsKeyPressed(KEY_L)) lod = !lod;
         if (IsKeyPressed(KEY_B)) staticInst = !staticInst;
 
-        const bool tracking = trackIndex >= 0 &&
-                              trackIndex < static_cast<int>(trackables.size());
-        if (tracking) {
-            const std::uint32_t id = trackables[trackIndex];
-            for (const auto& r : snap.records) {
-                if (r.entityId == id) {
-                    // Smoothly chase the tracked entity.
-                    cam.target = Vector3Lerp(cam.target, recPos(r), 0.2f);
-                    break;
-                }
-            }
+        // Resolve the followed entity; if it has left the scene, drop back to free
+        // camera. While following, smoothly chase it (orbit then rotates about it).
+        const TelemetryRecord* followed = nullptr;
+        if (followId >= 0) {
+            for (const auto& r : snap.records)
+                if (static_cast<long long>(r.entityId) == followId &&
+                    !(r.flags & FLAG_DESTROYED)) { followed = &r; break; }
+            if (!followed) followId = -1;
         }
+        const bool tracking = followed != nullptr;
+        if (tracking) cam.target = Vector3Lerp(cam.target, recPos(*followed), 0.2f);
         updateCamera(cam, tracking, false);
 
         // Age detonations.
@@ -1124,7 +1239,7 @@ int main(int argc, char** argv) {
         DT(line, 16, 172, 18, GRAY);
         DT(instLine, 16, 194, 18, Color{150, 200, 170, 255});
 
-        DT("[Tab] track  [C] free-cam  [B] buffers  [F] cull  [L] lod  [drag] orbit  [wheel] zoom",
+        DT("[Click] follow  [Tab] cycle  [Esc/C] free-cam  [drag] orbit  [wheel] zoom  [B]uf [F]cull [L]od",
                  16, screenH - 26, 16, Color{160, 170, 180, 255});
         {
             char fps[24];
@@ -1134,9 +1249,28 @@ int main(int argc, char** argv) {
         }
 
         if (tracking) {
-            std::snprintf(line, sizeof(line), "TRACKING #%u",
-                          trackables[trackIndex]);
-            DT(line, screenW - 220, 40, 20, GREEN);
+            std::snprintf(line, sizeof(line), "FOLLOWING #%lld", followId);
+            DT(line, screenW - 240, 40, 20, GREEN);
+        }
+
+        // --- Hover ring: encircle the missile under the cursor and label its
+        // allegiance (ENEMY / ALLY / DOMESTIC). One missile at a time, and only
+        // while not orbiting (a drag would make the pointer position meaningless).
+        if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
+            !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+            const int hov = pickNearestMissile(GetMousePosition(), 45.0f);
+            if (hov >= 0) {
+                const TelemetryRecord& r = snap.records[hov];
+                const Vector2 s = GetWorldToScreen(recPos(r), cam.toCamera());
+                const Color col = trackColor(r);
+                DrawRing(s, 18.0f, 21.0f, 0.0f, 360.0f, 48, col);
+                DrawRing(s, 21.0f, 22.5f, 0.0f, 360.0f, 48, ColorAlpha(BLACK, 0.5f));
+                const char* lbl = trackLabel(r);
+                const float lw = MeasureTextEx(uiFont, lbl, 18.0f, 1.0f).x;
+                DrawRectangle(static_cast<int>(s.x) + 26, static_cast<int>(s.y) - 11,
+                              static_cast<int>(lw) + 8, 22, ColorAlpha(BLACK, 0.55f));
+                DT(lbl, static_cast<int>(s.x) + 30, static_cast<int>(s.y) - 9, 18, col);
+            }
         }
 
         EndDrawing();

@@ -27,6 +27,11 @@ _deps/
 tools/tiles/
 tools/overture_heights.csv
 tools/*.log
+
+# Diagnostic telemetry dumps written by defense_sim's SIM_LOG env (see main.cpp).
+simlog*.csv
+*.simlog.csv
+sim_log*.csv
 un_coast*.json
 un_buildings*.json
 un_raw.json

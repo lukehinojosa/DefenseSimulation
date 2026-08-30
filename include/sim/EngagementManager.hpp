@@ -75,11 +75,33 @@ public:
         /// the ProNav turn command so an interceptor cannot pivot instantly.
         double  maxLateralAccel{40.0 * 9.81};
         /// Peak thrust/drag along the velocity (m/s^2) used to converge on the
-        /// cruise speed — finite, so speed changes are not instantaneous.
+        /// cruise speed -- finite, so speed changes are not instantaneous.
         double  axialAccel{50.0 * 9.81};
 
         // --- Ground plane & launch dynamics ---------------------------------
         double  groundZ{0.0};              ///< World floor; below this is a crash.
+        /// Skim guard (m AGL): below this an interceptor adds a gentle climb so a
+        /// round that has bled down onto the deck is lifted back to usable
+        /// altitude. It is deliberately low so it does not block the glide-slope
+        /// guidance from prosecuting genuinely low targets above it; the hard
+        /// no-penetration guarantee is the descent-rate cap in guide(), not this.
+        double  groundAvoidAltitude{60.0};
+        /// Seconds over which the below-floor climb closes the altitude deficit up
+        /// to the skyline floor (larger = gentler pull-up).
+        double  altSettleTime{3.0};
+        /// Interceptor terrain-following floor. The effective floor at any (x,y) is
+        /// the tallest building top within skylineLookahead metres (from the city
+        /// index) plus skylineMargin, so an interceptor levels off above the real
+        /// skyline everywhere buildings exist -- it never descends into a building
+        /// or the ground, on the city side or over New Jersey. Out over open
+        /// ground/water (no structures in range) the floor is just the ground, so
+        /// genuinely low threats there stay engageable. skylineClearance is an
+        /// additional minimum over the protected core (tapering out over
+        /// skylineTaperBand), covering the dense city even if the grid under-reads.
+        double  skylineMargin{60.0};
+        double  skylineLookahead{900.0};
+        double  skylineClearance{600.0};
+        double  skylineTaperBand{3000.0};
         double  launchHandoffAltitude{1000.0}; ///< Boost until clearing this AGL.
         double  protectedRadius{6000.0};   ///< Threats grounded within this XY
                                            ///< range of the asset are losses.
@@ -112,7 +134,7 @@ public:
 
     /**
      * @brief Spawn an interceptor entity at @p pos and register it.
-     * @param allegiance Friendly or Neutral — both prosecute hostile threats
+     * @param allegiance Friendly or Neutral -- both prosecute hostile threats
      *        (the allegiance matrix lets neutrals defend too).
      * @param launching  When true the interceptor starts on the ground boosting
      *        straight up (EFLAG_LAUNCHING) until it clears the hand-off altitude,
@@ -155,7 +177,7 @@ public:
      *
      * Any active entity (that is not still boosting off its pad) which has
      * descended to/through the ground, or entered a static city volume, is
-     * destroyed in place — this is what stops interceptors and leaked threats
+     * destroyed in place -- this is what stops interceptors and leaked threats
      * from clipping below Z = 0. A hostile grounded on the city or within the
      * protected radius of the asset is additionally tallied as an asset loss.
      * @return number of entities removed this frame.
@@ -195,6 +217,16 @@ public:
     /// Active interceptors that still have an assigned, living target.
     int activeEngagements() const;
 
+    // --- Terrain-collision instrumentation ---------------------------------
+    /// Entities removed this frame by the ground plane / by a city structure
+    /// (parallel to lastDestroyed(); a diagnostic consumer can tag the cause).
+    const std::vector<EntityId>& lastGroundHits() const { return lastGroundHits_; }
+    const std::vector<EntityId>& lastCityHits()   const { return lastCityHits_; }
+    /// Running totals of OWN/allied interceptors (Friendly or Neutral) lost to a
+    /// ground or city collision -- these should stay zero with terrain-following on.
+    int interceptorGroundLosses() const { return interceptorGroundLosses_; }
+    int interceptorCityLosses()   const { return interceptorCityLosses_; }
+
 private:
     bool isActiveHostile(EntityId id) const;
     void releaseIfTargetLost(Interceptor& ic);
@@ -213,8 +245,12 @@ private:
     std::vector<Interceptor> interceptors_;
     std::vector<EntityId>    lastDestroyed_;
     std::vector<EntityId>    lastAssetLosses_;
+    std::vector<EntityId>    lastGroundHits_;
+    std::vector<EntityId>    lastCityHits_;
     int                      interceptCount_{0};
     int                      assetFailures_{0};
+    int                      interceptorGroundLosses_{0};
+    int                      interceptorCityLosses_{0};
     double                   lastDt_{1.0 / 60.0};  ///< Last step, for the swept fuze.
     bool                     primed_{false};
 };

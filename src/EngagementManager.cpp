@@ -17,8 +17,8 @@ bool EngagementManager::isActiveHostile(EntityId id) const {
 
 std::vector<Threat> EngagementManager::buildThreatQueue() const {
     // Query the engageable-threat set via the allegiance matrix. Interceptors
-    // (Friendly or Neutral) never target one another — only hostiles are
-    // engageable — but the mask, not the entity type, decides that.
+    // (Friendly or Neutral) never target one another -- only hostiles are
+    // engageable -- but the mask, not the entity type, decides that.
     const std::vector<OctreeItem> hostiles =
         engine_.queryRange(engine_.index().bounds(), QUERY_ENGAGEABLE_THREATS);
 
@@ -50,8 +50,8 @@ std::vector<Threat> EngagementManager::buildThreatQueue() const {
 
 void EngagementManager::assignTargets() {
     // Friendly and allied-neutral defenders claim threats INDEPENDENTLY: a
-    // friendly round engages a hostile even if an ally is already on it — we do
-    // not trust the ally to finish the job — so the friendly battery covers
+    // friendly round engages a hostile even if an ally is already on it -- we do
+    // not trust the ally to finish the job -- so the friendly battery covers
     // every threat by itself while allied intercepts are pure redundancy. Within
     // one allegiance, assignments stay distinct (no two friendlies on one
     // threat, no two allies on one threat). Drop dead targets first so a round
@@ -140,6 +140,37 @@ void EngagementManager::guide(double dt) {
                          static_cast<long long>(q.id);
     }
 
+    // Terrain-following needs the static city index; build it once (same lazy
+    // build processGroundAndAssets uses, so whichever runs first pays for it).
+    if (!cityIndexed_) {
+        cityIndex_.build(config_.city);
+        cityIndexed_ = true;
+    }
+
+    // Effective ground floor for a given world position. Interceptors are held
+    // above this, so they level off rather than flying into terrain:
+    //  * the real local skyline anywhere buildings exist -- the tallest building
+    //    top within a lookahead of (x,y), plus a margin, so a round clears the
+    //    actual buildings on the city side AND over New Jersey/Brooklyn;
+    //  * a protected-core minimum that tapers out past the protected radius, as a
+    //    backstop over the dense city;
+    //  * otherwise just the ground, so low targets out over open ground/water are
+    //    still engageable.
+    auto floorAt = [&](const Vector3& p) {
+        double f = config_.groundZ;
+        const double h =
+            cityIndex_.skylineHeight(p.x, p.y, config_.skylineLookahead);
+        if (h > 0.0) f = std::max(f, config_.groundZ + h + config_.skylineMargin);
+
+        const double dx = p.x - config_.defendedAsset.x;
+        const double dy = p.y - config_.defendedAsset.y;
+        const double d = std::sqrt(dx * dx + dy * dy);
+        const double band = std::max(config_.skylineTaperBand, 1e-3);
+        const double t = std::clamp((d - config_.protectedRadius) / band, 0.0, 1.0);
+        f = std::max(f, config_.groundZ + (1.0 - t) * config_.skylineClearance);
+        return f;
+    };
+
     for (Interceptor& ic : interceptors_) {
         Entity* self = engine_.entityById(ic.id);
         if (self == nullptr || !self->isActive()) {
@@ -168,15 +199,64 @@ void EngagementManager::guide(double dt) {
         // mode below so two interceptors never fly through one another. Only
         // lower-priority rounds actually deviate (see the ranking above).
         const Vector3 sep = separationAccel(*self, priority[ic.id], priority);
-        // Steer toward a desired heading under airframe limits, plus avoidance.
+
+        // --- Keeping rounds off the deck (three coupled parts) ----------------
+        // ProNav is terrain-blind; against a low target it commands a straight
+        // dive through Z = 0. Rather than let a round crash (or merely decline the
+        // shot), the guidance keeps it flying and finds a workable path:
+        //
+        //  1. Glide-slope vertical management (in the ProNav branch below) spends
+        //     altitude in step with horizontal closure, so the round arrives level
+        //     with a low target and intercepts it flying horizontally -- an actual
+        //     alternative path, not a dive.
+        //  2. A hard descent-rate cap (terrainFloor) bounds vertical speed to what
+        //     the airframe can still arrest in the remaining altitude,
+        //     |v_z| <= sqrt(2 * a_max * AGL). As AGL -> 0 the cap -> 0, so the
+        //     round physically cannot cross the floor regardless of geometry; a
+        //     target too low to reach this pass is overflown and re-attacked.
+        //  3. A gentle skim guard (pullUp) below groundAvoidAltitude lifts a round
+        //     that has bled onto the deck back to usable altitude.
+        Vector3 pullUp{};
+        {
+            const double guard = config_.groundAvoidAltitude;
+            const double agl = self->position.z - floorAt(self->position);
+            if (guard > 0.0 && agl < guard) {
+                double t = (guard - agl) / guard;      // 0 at guard -> 1 at floor
+                if (t > 1.0) t = 1.0;
+                pullUp.z = config_.maxLateralAccel * t * t; // gentle lift off the deck
+            }
+        }
+        const Vector3 avoid = sep + pullUp;
+
+        // Clamp descent so the round can never reach the deck. Two bounds, take
+        // the tighter: (1) the rate the airframe can still arrest within the
+        // remaining altitude, sqrt(2 * a_max * AGL) -- smooth at altitude; (2) a
+        // per-STEP bound, (AGL - skim) / dt, so a single Euler step can never jump
+        // past the ground (the continuous bound alone overshoots when AGL is tiny:
+        // sqrt(2*a*AGL)*dt can exceed AGL). The skim margin holds the round a hair
+        // above Z = 0 so it levels off rather than touching down with a downward
+        // velocity (which the ground fail-safe would score as a crash). Climb and
+        // cruise are untouched; only descent near the floor is bounded.
+        constexpr double kSkimMargin = 1.0; // hold ~1 m over the deck (m)
+        auto terrainFloor = [&](Vector3 v) {
+            const double agl = self->position.z - floorAt(self->position);
+            double cap = std::sqrt(2.0 * config_.maxLateralAccel * std::max(agl, 0.0));
+            const double stepCap = (agl - kSkimMargin) / dt; // <=0 once at/below skim
+            if (stepCap < cap) cap = stepCap;
+            if (cap < 0.0) cap = 0.0;                  // at/below skim: no descent
+            if (v.z < -cap) v.z = -cap;
+            return v;
+        };
+
+        // Steer toward a desired heading under airframe limits, plus avoidance,
+        // then bound the descent rate so the round can always arrest by the floor.
         auto steerAvoiding = [&](const Vector3& desiredDir) {
             const Vector3 dd = desiredDir.normalized();
             const Vector3 accelCmd =
-                (dd * ic.cruiseSpeed - self->velocity) / dt + sep;
-            return guidance::applyAirframeLimits(self->velocity, accelCmd,
-                                                 ic.cruiseSpeed,
-                                                 config_.maxLateralAccel,
-                                                 config_.axialAccel, dt);
+                (dd * ic.cruiseSpeed - self->velocity) / dt + avoid;
+            return terrainFloor(guidance::applyAirframeLimits(
+                self->velocity, accelCmd, ic.cruiseSpeed, config_.maxLateralAccel,
+                config_.axialAccel, dt));
         };
 
         // --- Out of fuel: spend the round clear of the city ------------------
@@ -232,12 +312,45 @@ void EngagementManager::guide(double dt) {
         // ProNav command (plus avoidance), then clamp to the airframe's
         // lateral-G and thrust limits: the interceptor arcs through the turn and
         // bleeds/gains speed over time instead of instantly re-pointing.
-        const Vector3 accel = guidance::proNavAcceleration(
+        Vector3 accel = guidance::proNavAcceleration(
             self->position, self->velocity, tgt->position, tgt->velocity,
             config_.navConstant);
-        self->velocity = guidance::applyAirframeLimits(
+
+        // Pure ProNav (its 3D lead is what actually kills threats) + separation.
+        // Terrain avoidance is applied AFTER, decoupled from the intercept, so it
+        // never distorts the collision course: an earlier scheme that replaced
+        // ProNav's vertical command with altitude-matching made rounds zoom-climb
+        // past 20 km chasing a climbing target's height and miss almost everything.
+        Vector3 v = guidance::applyAirframeLimits(
             self->velocity, accel + sep, ic.cruiseSpeed, config_.maxLateralAccel,
             config_.axialAccel, dt);
+
+        // Terrain floor: below the local skyline floor, force a climb up to it
+        // (trading forward speed for the pull-up so total speed stays bounded);
+        // floorAt's lookahead starts the climb before the round reaches a tall
+        // cluster. terrainFloor() then caps any descent to what the airframe can
+        // arrest before the floor. Together they keep the round off the ground and
+        // out of the buildings without touching the horizontal intercept.
+        const double floorZ = floorAt(self->position);
+        const double clearance = floorZ + config_.groundAvoidAltitude;
+        if (self->position.z < clearance) {
+            const double tauUp = std::max(config_.altSettleTime * 0.4, 1e-3);
+            const double climb =
+                std::min((clearance - self->position.z) / tauUp, ic.cruiseSpeed);
+            if (v.z < climb) {
+                v.z = climb;
+                const double vh2 = v.x * v.x + v.y * v.y;
+                const double budget =
+                    ic.cruiseSpeed * ic.cruiseSpeed - climb * climb;
+                if (budget <= 0.0) {
+                    v.x = 0.0; v.y = 0.0; // climb needs the whole speed budget
+                } else if (vh2 > budget) {
+                    const double s = std::sqrt(budget / vh2);
+                    v.x *= s; v.y *= s;   // scale horizontal to preserve speed
+                }
+            }
+        }
+        self->velocity = terrainFloor(v);
     }
 }
 
@@ -306,6 +419,8 @@ int EngagementManager::processDetonations() {
 int EngagementManager::processGroundAndAssets() {
     int removed = 0;
     lastAssetLosses_.clear();
+    lastGroundHits_.clear();
+    lastCityHits_.clear();
 
     // Build the static-structure broad phase once, the first time we need it.
     // config_.city is fixed after construction, so a single build is enough; the
@@ -346,6 +461,18 @@ int EngagementManager::processGroundAndAssets() {
         }
         e.status = EntityStatus::Destroyed;
         lastDestroyed_.push_back(e.id); // reuse the detonation-event channel
+
+        // Record the cause (for diagnostics) and tally any own/allied interceptor
+        // lost to terrain -- with terrain-following guidance these should be zero.
+        const bool interceptor =
+            e.type == EntityType::Friendly || e.type == EntityType::Neutral;
+        if (hitGround) {
+            lastGroundHits_.push_back(e.id);
+            if (interceptor) ++interceptorGroundLosses_;
+        } else { // hitCity (only reached when !hitGround)
+            lastCityHits_.push_back(e.id);
+            if (interceptor) ++interceptorCityLosses_;
+        }
 
         // A leaked hostile that strikes the city, or grounds within the
         // protected footprint, is a defended-asset loss.

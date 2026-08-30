@@ -15,13 +15,13 @@ EntityId SimulationEngine::spawn(Entity e) {
 }
 
 void SimulationEngine::step(double dt) {
-    // Phase 1 — parallel kinematic integration. Each task index maps to a
+    // Phase 1 -- parallel kinematic integration. Each task index maps to a
     // single entity element, so writes never overlap and no locking is needed.
     pool_.parallelFor(0, entities_.size(), [this, dt](std::size_t i) {
         entities_[i].integrate(dt);
     });
 
-    // Phase 2 — single-writer spatial rebuild from the updated positions.
+    // Phase 2 -- single-writer spatial rebuild from the updated positions.
     rebuildIndex();
 }
 

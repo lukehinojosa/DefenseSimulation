@@ -1,4 +1,4 @@
-// Defense Simulation — demonstration harness (Phases 1 & 2).
+// Defense Simulation -- demonstration harness (engine + engagement demos).
 //
 // Two scenarios are run end-to-end from the command line:
 //   1. Performance: a large mixed population advanced by the multithreaded
@@ -196,7 +196,7 @@ void runTelemetryPublisher(const sim::SimConfig& scfg, const std::string& udpHos
     // Hostile salvo: each threat starts on a random bearing at a random range
     // and a random altitude. Ground launches boost vertically before pitching
     // over onto the city; ones that spawn already above the hand-off altitude
-    // cruise straight in — a mixed-profile raid rather than a uniform wave.
+    // cruise straight in -- a mixed-profile raid rather than a uniform wave.
     std::uniform_real_distribution<double> bearing(0.0, 2.0 * 3.14159265);
     std::uniform_real_distribution<double> range(scfg.threatRangeMin,
                                                  scfg.threatRangeMax);
@@ -290,7 +290,7 @@ void runTelemetryPublisher(const sim::SimConfig& scfg, const std::string& udpHos
         for (const Entity& e : engine.entities()) {
             if (e.type == EntityType::Hostile && e.isActive()) ++activeHostiles;
         }
-        // Count only our OWN (friendly) ready shooters — allied-neutral rounds
+        // Count only our OWN (friendly) ready shooters -- allied-neutral rounds
         // are treated as unreliable and are not counted toward coverage. That
         // way the friendly battery is always sized to neutralize every threat by
         // itself; any threat an ally happens to kill just frees a friendly to
@@ -303,7 +303,7 @@ void runTelemetryPublisher(const sim::SimConfig& scfg, const std::string& udpHos
                 ++readyFriendly;
             }
         }
-        // Launch only when a threat has no friendly shooter yet — never fire a
+        // Launch only when a threat has no friendly shooter yet -- never fire a
         // round that would have no target.
         if (launchCooldown <= 0.0 && friendlyLaunched < kMaxFriendly &&
             readyFriendly < activeHostiles) {
@@ -334,9 +334,32 @@ void runTelemetryPublisher(const sim::SimConfig& scfg, const std::string& udpHos
     }
     std::cout << "  run the monitor:  ./telemetry_monitor\n\n";
 
+    // Optional diagnostic CSV dump (env SIM_LOG=path): one row per active entity
+    // per frame plus a row per destruction event, enough to trace every trajectory
+    // (e.g. an interceptor that reaches the deck) offline.
+    //   * SIM_LOG alone   -> log the NORMAL real-time run (the exact session the
+    //                        visualizer is showing), for scfg.durationSeconds.
+    //   * + SIM_LOG_SECONDS -> headless-fast: skip real-time pacing and cover that
+    //                        many seconds of SIMULATED time regardless of the run
+    //                        length / time scale (bulk offline analysis).
+    const char* logPath = std::getenv("SIM_LOG");
+    const bool logging = (logPath != nullptr && logPath[0] != '\0');
+    const char* logSecEnv = std::getenv("SIM_LOG_SECONDS");
+    const bool fastLog = logging && (logSecEnv != nullptr);
+    std::ofstream log;
+    if (logging) {
+        log.open(logPath);
+        log << "t,frame,id,type,launching,booster,x,y,z,vx,vy,vz,"
+               "targetId,destroyed,assethit,cause\n"; // cause: 0 none/fuze,1 ground,2 city
+        log << std::fixed << std::setprecision(3);
+    }
+    const double logSeconds = fastLog ? std::atof(logSecEnv) : 0.0;
+
     const auto start = std::chrono::steady_clock::now();
     std::uint64_t frameId = 0;
-    const int totalFrames = static_cast<int>(scfg.durationSeconds * 60.0);
+    const int totalFrames = fastLog
+        ? static_cast<int>(logSeconds / simDt) + 1
+        : static_cast<int>(scfg.durationSeconds * 60.0);
     for (int f = 0; f < totalFrames; ++f) {
         directThreats(simDt);   // advance the threat launch/cruise state machine
         serviceLaunches(simDt); // ripple up interceptors to match the live threat
@@ -373,6 +396,37 @@ void runTelemetryPublisher(const sim::SimConfig& scfg, const std::string& udpHos
             }
         }
 
+        if (logging) {
+            const double simTime = (f + 1) * simDt;
+            for (const Entity& e : engine.entities()) {
+                if (!e.isActive()) continue;
+                std::uint32_t tid = tlm::kNoTargetId;
+                auto it = targetOf.find(e.id);
+                if (it != targetOf.end()) tid = it->second;
+                log << simTime << ',' << frameId << ',' << e.id << ','
+                    << static_cast<int>(e.type) << ','
+                    << ((e.flags & sim::EFLAG_LAUNCHING) ? 1 : 0) << ','
+                    << (e.isBoosting() ? 1 : 0) << ','
+                    << e.position.x << ',' << e.position.y << ',' << e.position.z << ','
+                    << e.velocity.x << ',' << e.velocity.y << ',' << e.velocity.z << ','
+                    << static_cast<long long>(tid) << ",0,0,0\n";
+            }
+            const std::unordered_set<sim::EntityId> groundSet(
+                mgr.lastGroundHits().begin(), mgr.lastGroundHits().end());
+            const std::unordered_set<sim::EntityId> citySet(
+                mgr.lastCityHits().begin(), mgr.lastCityHits().end());
+            for (sim::EntityId id : mgr.lastDestroyed()) {
+                const Entity* e = engine.entityById(id);
+                if (e == nullptr) continue;
+                const int cause = groundSet.count(id) ? 1 : (citySet.count(id) ? 2 : 0);
+                log << simTime << ',' << frameId << ',' << id << ','
+                    << static_cast<int>(e->type) << ",0,0,"
+                    << e->position.x << ',' << e->position.y << ',' << e->position.z << ','
+                    << e->velocity.x << ',' << e->velocity.y << ',' << e->velocity.z
+                    << ",-1,1," << (assetLoss.count(id) != 0 ? 1 : 0) << ',' << cause << '\n';
+            }
+        }
+
         const std::uint64_t ts = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch())
@@ -405,13 +459,20 @@ void runTelemetryPublisher(const sim::SimConfig& scfg, const std::string& udpHos
         }
 
         ++frameId;
-        std::this_thread::sleep_until(start + std::chrono::duration<double>(
-                                                  (f + 1) * dt));
+        if (!fastLog) { // real-time pacing for normal runs (logged or not)
+            std::this_thread::sleep_until(start + std::chrono::duration<double>(
+                                                      (f + 1) * dt));
+        }
     }
+    if (logging) log.close();
 
     std::cout << "Telemetry publisher finished: " << frameId << " frames, "
               << mgr.interceptCount() << " intercepts, "
-              << mgr.assetFailures() << " asset losses.\n";
+              << mgr.assetFailures() << " asset losses.\n"
+              << "  interceptor terrain losses: "
+              << (mgr.interceptorGroundLosses() + mgr.interceptorCityLosses())
+              << " (ground " << mgr.interceptorGroundLosses()
+              << ", city " << mgr.interceptorCityLosses() << ")\n";
 }
 
 // Locate the scenario config: $SIM_CONFIG if set, else the first of a few
@@ -455,7 +516,7 @@ int main(int argc, char** argv) {
     const std::size_t entityCount = (argc > 1) ? std::stoul(argv[1]) : 10000;
     const int         frames      = (argc > 2) ? std::stoi(argv[2]) : 60;
 
-    std::cout << "Defense Simulation - Phases 1-3\n\n";
+    std::cout << "Defense Simulation\n\n";
     runPerformanceDemo(entityCount, frames);
     runEngagementDemo();
     return 0;

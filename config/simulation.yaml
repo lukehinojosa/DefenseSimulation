@@ -1,7 +1,7 @@
-# Defense Simulation — data-driven scenario constants.
+# Defense Simulation -- data-driven scenario constants.
 #
 # These values drive the `defense_sim telemetry` engagement scenario (the one the
-# C2 visualizer displays). Edit and re-run — no rebuild needed. Any key you omit
+# C2 visualizer displays). Edit and re-run -- no rebuild needed. Any key you omit
 # falls back to the built-in default, and if this whole file is missing the sim
 # still runs on defaults.
 #
@@ -36,7 +36,7 @@ engagement:
   separation_accel_g: 60.0                # collision-avoidance authority.
 
 threats:
-  count: 16
+  count: 100
   spawn_range_min: 23000.0     # random distance from the asset (m).
   spawn_range_max: 36000.0
   spawn_altitude_min: 0.0      # random start altitude (m); 0 = ground launch.
@@ -49,15 +49,15 @@ threats:
 interceptors:
   friendly:                    # own, ground-launched from the battery
     standing_battery: 8        # rounds fired at t=0.
-    max_launched: 40           # hard cap on total friendly launches.
+    max_launched: 1000         # hard cap on total friendly launches.
     pad_radius: 11000.0        # battery ring radius (m): outside the ~9 km city
                                # skyline + 6 km protected zone, so rounds never
                                # climb up through the buildings.
     cruise_speed: 1300.0
-    launch_cooldown: 0.15      # min seconds between demand-driven launches.
+    launch_cooldown: 0.0       # min seconds between demand-driven launches.
 
-  neutral:                     # allied, airborne — engaged but not trusted
-    count: 8
+  neutral:                     # allied, airborne -- engaged but not trusted
+    count: 20
     spawn_range_min: 18000.0   # random distance in from the asset (m).
     spawn_range_max: 22000.0
     spawn_altitude_min: 2500.0

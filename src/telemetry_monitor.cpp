@@ -2,7 +2,7 @@
 //
 // A standalone, lightweight console process that attaches to the simulation's
 // POSIX shared-memory telemetry ring and reports live threat levels, intercept
-// counts, and the telemetry frame rate. It performs no simulation work — it is
+// counts, and the telemetry frame rate. It performs no simulation work -- it is
 // a pure consumer, demonstrating the decoupled command-and-display process from
 // the architecture diagram.
 

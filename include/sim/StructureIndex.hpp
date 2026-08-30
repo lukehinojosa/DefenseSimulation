@@ -17,7 +17,7 @@ namespace sim {
  * @brief Uniform-grid broad phase over the static city skyline.
  *
  * The engine's per-frame "did this missile enter a building?" test used to scan
- * every CityStructure for every active entity — O(entities * buildings), which
+ * every CityStructure for every active entity -- O(entities * buildings), which
  * is fine at a few thousand boxes but collapses at the 1:1 city's target scale
  * (~150k). This index hashes each building's ground footprint into a uniform XY
  * grid once at build time; a point query then hashes to a single cell and tests
@@ -26,8 +26,8 @@ namespace sim {
  *
  * Why a grid and not the Octree: the Octree stores dynamic *points* (entities)
  * and is rebuilt every frame. The city is static *area* data lying on the
- * ground plane, so a build-once uniform grid — the classic broad-phase for many
- * small, similarly-sized static AABBs — is both simpler and faster here. Two
+ * ground plane, so a build-once uniform grid -- the classic broad-phase for many
+ * small, similarly-sized static AABBs -- is both simpler and faster here. Two
  * structures, each matched to the data it indexes.
  *
  * Correctness: a building is registered in every cell its footprint overlaps, so
@@ -59,6 +59,8 @@ public:
             maxX  = std::max(maxX,  s.box.max.x);
             maxY  = std::max(maxY,  s.box.max.y);
         }
+        maxX_ = maxX;
+        maxY_ = maxY;
         nx_ = std::max(1, static_cast<int>(std::floor((maxX - minX_) / cell_)) + 1);
         ny_ = std::max(1, static_cast<int>(std::floor((maxY - minY_) / cell_)) + 1);
         cells_.assign(static_cast<std::size_t>(nx_) * ny_, {});
@@ -92,12 +94,37 @@ public:
         return nullptr;
     }
 
+    /**
+     * @brief Tallest structure top within @p pad metres of (@p x, @p y), or 0.
+     *
+     * Scans the grid cells overlapping the padded query box and returns the
+     * greatest box.max.z among their structures. The pad acts as a lookahead so a
+     * caller (e.g. interceptor terrain-following) sees a tall building's height
+     * before it arrives over it. Returns 0 when the query lies entirely off the
+     * city footprint, so open ground/water reports "no skyline". O(cells in pad).
+     */
+    double skylineHeight(double x, double y, double pad = 0.0) const {
+        if (cells_.empty()) return 0.0;
+        if (x + pad < minX_ || x - pad > maxX_ ||
+            y + pad < minY_ || y - pad > maxY_) {
+            return 0.0; // wholly outside the footprint -> no skyline
+        }
+        const int x0 = clampX(cellX(x - pad)), x1 = clampX(cellX(x + pad));
+        const int y0 = clampY(cellY(y - pad)), y1 = clampY(cellY(y + pad));
+        double h = 0.0;
+        for (int gy = y0; gy <= y1; ++gy)
+            for (int gx = x0; gx <= x1; ++gx)
+                for (std::uint32_t i : cells_[index(gx, gy)])
+                    h = std::max(h, structures_[i].box.max.z);
+        return h;
+    }
+
     bool        empty() const { return structures_.empty(); }
     std::size_t structureCount() const { return structures_.size(); }
     int         gridWidth() const { return nx_; }
     int         gridHeight() const { return ny_; }
 
-    /// Largest per-cell candidate count — a health check on cell sizing (tests).
+    /// Largest per-cell candidate count -- a health check on cell sizing (tests).
     std::size_t maxBucket() const {
         std::size_t m = 0;
         for (const auto& c : cells_) m = std::max(m, c.size());
@@ -117,6 +144,7 @@ private:
     std::vector<std::vector<std::uint32_t>> cells_;
     double cell_{kDefaultCellSize};
     double minX_{0.0}, minY_{0.0};
+    double maxX_{0.0}, maxY_{0.0};
     int    nx_{0}, ny_{0};
 };
 

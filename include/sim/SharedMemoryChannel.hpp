@@ -50,7 +50,7 @@ struct SharedRegion {
  * @brief Writer end of the shared-memory telemetry ring.
  *
  * Creates (or attaches to) the POSIX shared-memory object, maps it, and
- * publishes frames with no allocation on the hot path — records are copied
+ * publishes frames with no allocation on the hot path -- records are copied
  * straight into the mapped ring.
  */
 class ShmPublisher {

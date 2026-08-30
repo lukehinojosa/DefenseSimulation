@@ -16,7 +16,7 @@ namespace sim {
  * keys present in the YAML file, so a partial file is fine and a missing or
  * unparseable file simply runs the defaults. Accelerations are expressed in g
  * (Earth gravities) here and converted to m/s^2 (via kG) where the engine needs
- * them — that keeps the YAML readable ("55 g") rather than "539.55".
+ * them -- that keeps the YAML readable ("55 g") rather than "539.55".
  */
 struct SimConfig {
     static constexpr double kG = 9.81;

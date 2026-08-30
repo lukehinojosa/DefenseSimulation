@@ -30,7 +30,7 @@ struct OctreeItem {
  *
  * The tree partitions a fixed world volume into eight octants per level. A
  * node holds items directly until it exceeds its capacity, at which point it
- * subdivides and pushes its items down to the children — unless the maximum
+ * subdivides and pushes its items down to the children -- unless the maximum
  * depth has been reached, in which case the node is allowed to overflow
  * (necessary because many coincident points cannot be separated by further
  * subdivision).
