@@ -737,6 +737,13 @@ int main(int argc, char** argv) {
     // Set by Tab-cycling the trackables list or by left-clicking a missile;
     // cleared by [C]/[Esc] or when the followed track leaves the scene.
     long long followId = -1;
+    // Rigid-lock bookkeeping: once the camera has acquired the followed track we
+    // pin its look-at point exactly to the track, so the track holds a fixed screen
+    // position and its residual interpolation jitter moves the camera with it
+    // (canceling on screen). followLocked latches after the smooth acquisition and
+    // resets whenever the followed id changes.
+    long long lockedFollowId = -1;
+    bool      followLocked   = false;
     // Left-button click-vs-drag disambiguation: a press that releases without
     // moving far is a pick (select a missile); a moving press orbits the camera.
     Vector2 pressPos{0.0f, 0.0f};
@@ -760,6 +767,44 @@ int main(int argc, char** argv) {
     for (int k = 0; k < 5; ++k)
         for (int p = 0; p < 2; ++p) cityTotal += static_cast<int>(groups[k][p].xform.size());
 
+    // --- Snapshot interpolation (entity interpolation) -----------------------
+    // Telemetry arrives at the engine's fixed tick rate (60 Hz), well below the
+    // render rate, so drawing raw snapshot positions makes fast tracks step
+    // visibly. Extrapolating along velocity fills the gaps but overshoots and
+    // snaps at each tick. Instead we render a fixed delay in the PAST and slide
+    // between buffered snapshots, so every drawn position lies between two
+    // known-good samples (never overshoots, never snaps).
+    //
+    // The subtlety is the TIME BASE. We interpolate in FRAME-INDEX space, not by
+    // producer timestamp. The engine advances a FIXED physics step per telemetry
+    // frame, so equal frame-id increments are equal motion; the timestamps, by
+    // contrast, carry the producer's wall-clock scheduling jitter (a late frame
+    // stamps ~2 ticks after the previous one while still advancing a single step),
+    // and interpolating against them makes the speed lurch. Playing frame ids back
+    // at the smoothed real production rate keeps motion uniform and immune to that
+    // jitter, and driving the slide off raylib's smooth clock (not the per-frame
+    // arrival detection) avoids folding render-frame jitter in. A short history is
+    // kept so the target is always bracketed even when arrivals are uneven; frame
+    // gaps from the render outrunning telemetry are absorbed by the bracket span.
+    struct Snap { double frame; std::unordered_map<std::uint32_t, Vector3> pos; };
+    std::deque<Snap> hist;             // oldest..newest, keyed by frame id
+    double rateEma       = 60.0;       // telemetry frames/sec in real time
+    double newestArrival = 0.0;        // GetTime() when the newest snapshot landed
+    double playF         = 0.0;        // playback position in frame-id space
+    bool   havePlay      = false;
+    bool   haveArrival   = false;
+    const Snap* loSnap = nullptr;      // interpolation bracket, refreshed per frame
+    const Snap* hiSnap = nullptr;
+    float  interpAlpha = 0.0f;         // position within [loSnap, hiSnap]
+    auto livePos = [&](const TelemetryRecord& r) -> Vector3 {
+        const Vector3 cur = recPos(r); // fall back to the raw latest sample
+        if (loSnap == nullptr || hiSnap == nullptr) return cur;
+        const auto lo = loSnap->pos.find(r.entityId);
+        const auto hi = hiSnap->pos.find(r.entityId);
+        if (lo == loSnap->pos.end() || hi == hiSnap->pos.end()) return cur;
+        return Vector3Lerp(lo->second, hi->second, interpAlpha);
+    };
+
     // Return the index into snap.records of the missile whose projected screen
     // position is nearest `sp` and within `maxPx` pixels, or -1. Points behind
     // the camera are rejected (a world point behind the eye projects to a bogus
@@ -773,7 +818,7 @@ int main(int argc, char** argv) {
             const TelemetryRecord& r = snap.records[i];
             if (r.flags & FLAG_DESTROYED) continue;
             if (!isHostile(r) && !isInterceptor(r)) continue;
-            const Vector3 wp = recPos(r);
+            const Vector3 wp = livePos(r);
             if (Vector3DotProduct(Vector3Subtract(wp, c3.position), fwd) <= 0.0f)
                 continue; // behind the camera
             const Vector2 s = GetWorldToScreen(wp, c3);
@@ -783,12 +828,53 @@ int main(int argc, char** argv) {
         return best;
     };
 
+    // --- Render-rate control -------------------------------------------------
+    // The visualizer is a separate process from the engine, so its refresh rate
+    // is fully decoupled from the physics tick: capping (or uncapping) it here
+    // never speeds up or slows down the simulation, it only changes how often the
+    // latest telemetry snapshot is redrawn. A HUD slider (tied to an integer text
+    // box) sets the cap live between 0 and 1000; 0 means uncapped. setFps() is the
+    // single writer, so the two widgets never disagree.
+    int  targetFps      = 60;      // current render cap; 0 = uncapped
+    bool fpsSliderDrag  = false;   // the slider knob is being dragged
+    bool fpsBoxEditing  = false;   // the integer text box has keyboard focus
+    std::string fpsBoxText = "60"; // live text mirror of targetFps
+    auto setFps = [&](int f) {
+        f = (f < 0) ? 0 : (f > 1000 ? 1000 : f);
+        if (f != targetFps) {
+            targetFps = f;
+            SetTargetFPS(targetFps); // raylib treats 0 as "no wait" (uncapped)
+        }
+        if (!fpsBoxEditing) fpsBoxText = std::to_string(targetFps);
+    };
+    auto commitFpsBox = [&]() {
+        // An empty box reverts to the current value (so a stray click-away never
+        // jumps to uncapped); to actually set 0 the user types the digit '0'.
+        if (!fpsBoxText.empty()) setFps(std::stoi(fpsBoxText));
+        fpsBoxText = std::to_string(targetFps);
+    };
+
     while (!WindowShouldClose()) {
+        // Sample the wall clock once per frame so the snapshot arrival time and the
+        // production-rate estimate share a single consistent "now".
+        const double loopTime = GetTime();
+
         // Track the live window size so the HUD/panel and 3D aspect follow resizes;
         // F11 toggles borderless fullscreen.
         if (IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();
         screenW = GetScreenWidth();
         screenH = GetScreenHeight();
+
+        // Display/FPS control panel (top-right). Computed up front because the
+        // pointer being over it (or actively dragging the slider) must suppress
+        // camera orbit/zoom and the click-to-follow pick for this whole frame.
+        const int panelW = 252, panelH = 92;
+        const Rectangle panelRect{ static_cast<float>(screenW - panelW - 12),
+                                   12.0f, static_cast<float>(panelW),
+                                   static_cast<float>(panelH) };
+        const Vector2 mousePos = GetMousePosition();
+        const bool overPanel = CheckCollisionPointRec(mousePos, panelRect);
+        const bool uiActive = overPanel || fpsSliderDrag;
 
         // --- Ingest -----------------------------------------------------------
         const bool haveNew = consumer->PollLatestFrame(snap);
@@ -813,7 +899,35 @@ int main(int argc, char** argv) {
             // the ids still live this frame so we can prune orphaned trails below.
             std::unordered_set<std::uint32_t> present;
             present.reserve(snap.records.size());
-            const double now = GetTime();
+            const double now = loopTime;
+
+            // Push this snapshot (producer time base) into the interpolation
+            // history, caching only live tracks (destroyed ones burst as
+            // detonations). A few frames of history are enough to always bracket
+            // the delayed playback time.
+            const double frameId = static_cast<double>(snap.header.frameId);
+            // Smoothed real-time production rate (frames advanced per second of
+            // local time), outlier-guarded. A scalar low-pass, not a feedback loop
+            // into the motion, so it cannot ring.
+            if (haveArrival && !hist.empty()) {
+                const double dF = frameId - hist.back().frame;
+                const double dL = now - newestArrival;
+                if (dL > 1e-4 && dF > 0.0) {
+                    const double instRate = dF / dL;
+                    if (instRate > 10.0 && instRate < 1000.0)
+                        rateEma += (instRate - rateEma) * 0.05;
+                }
+            }
+            Snap s;
+            s.frame = frameId;
+            s.pos.reserve(snap.records.size());
+            for (const auto& rr : snap.records)
+                if (!(rr.flags & FLAG_DESTROYED))
+                    s.pos[rr.entityId] = recPos(rr);
+            hist.push_back(std::move(s));
+            while (hist.size() > 8) hist.pop_front();
+            newestArrival = now;
+            haveArrival = true;
             for (const auto& r : snap.records) {
                 if (r.flags & FLAG_DESTROYED) {
                     detonations.push_back(Detonation{recPos(r), 0.0f});
@@ -863,6 +977,48 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Advance the playback position in FRAME-INDEX space and pick this frame's
+        // interpolation bracket. playF advances by real frame time times the
+        // smoothed production rate, so on-screen motion is uniform regardless of
+        // render rate; because the axis is frame id (a fixed motion step per frame)
+        // it is immune to the producer's timestamp jitter. A GENTLE first-order
+        // pull keeps playF a fixed delay behind the newest frame to cancel slow
+        // drift; being first order it settles without overshoot, so it cannot ring
+        // (unlike a hard re-anchor, which snaps every frame the rate estimate is
+        // slightly off). Clamping to the buffer ends holds the newest sample on a
+        // stall rather than extrapolating.
+        loSnap = hiSnap = nullptr;
+        if (hist.size() >= 2 && haveArrival) {
+            const std::size_t n = hist.size();
+            const double target = hist.back().frame - 2.5; // frames behind newest
+            if (!havePlay) {
+                playF = target;
+                havePlay = true;
+            } else {
+                // Carry motion at the smoothed production rate, then apply a gentle
+                // first-order drift trim with a FRAME-RATE-INDEPENDENT gain (dt over
+                // a fixed time constant): a per-frame constant would correct far
+                // harder at high render rates and re-inject the staircase ripple.
+                const double dt = GetFrameTime();
+                playF += dt * rateEma;
+                const double tau = 0.2; // seconds; well above the 60 Hz frame step
+                playF += (target - playF) * std::min(1.0, dt / tau);
+            }
+            if (playF < hist.front().frame) playF = hist.front().frame;
+            if (playF > hist.back().frame)  playF = hist.back().frame;
+            for (std::size_t i = 0; i + 1 < n; ++i) {
+                if (playF >= hist[i].frame && playF <= hist[i + 1].frame) {
+                    const double span =
+                        std::max(1e-6, hist[i + 1].frame - hist[i].frame);
+                    loSnap = &hist[i];
+                    hiSnap = &hist[i + 1];
+                    interpAlpha = static_cast<float>((playF - hist[i].frame) / span);
+                    break;
+                }
+            }
+            if (loSnap == nullptr) { loSnap = hiSnap = &hist.back(); interpAlpha = 1.0f; }
+        }
+
         // --- Trackable set (hostiles then interceptors) for Tab-cycling -------
         std::vector<std::uint32_t> trackables;
         for (const auto& r : snap.records)
@@ -880,7 +1036,8 @@ int main(int argc, char** argv) {
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
             pressDrag = std::max(pressDrag,
                                  Vector2Distance(GetMousePosition(), pressPos));
-        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && pressDrag < 6.0f) {
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && pressDrag < 6.0f &&
+            !uiActive) {
             const int hit = pickNearestMissile(pressPos, 32.0f);
             if (hit >= 0) {
                 followId = static_cast<long long>(snap.records[hit].entityId);
@@ -914,8 +1071,20 @@ int main(int argc, char** argv) {
             if (!followed) followId = -1;
         }
         const bool tracking = followed != nullptr;
-        if (tracking) cam.target = Vector3Lerp(cam.target, recPos(*followed), 0.2f);
-        updateCamera(cam, tracking, false);
+        if (tracking) {
+            const Vector3 mp = livePos(*followed);
+            if (followId != lockedFollowId) { // new target: re-acquire smoothly
+                followLocked = false;
+                lockedFollowId = followId;
+            }
+            if (followLocked) {
+                cam.target = mp; // rigid: camera is a child of the track's position
+            } else {
+                cam.target = Vector3Lerp(cam.target, mp, 0.2f); // smooth acquire
+                if (Vector3Distance(cam.target, mp) < 0.05f) followLocked = true;
+            }
+        }
+        updateCamera(cam, tracking, uiActive);
 
         // Age detonations.
         const float dt = GetFrameTime();
@@ -1143,7 +1312,7 @@ int main(int argc, char** argv) {
             // a short heading dart is kept as a sensor annotation.
             for (const auto& r : snap.records) {
                 if (r.flags & FLAG_DESTROYED) continue;
-                const Vector3 p = recPos(r);
+                const Vector3 p = livePos(r);
                 const Vector3 v = recVel(r);
                 const bool boosting = isBooster(r);
 
@@ -1177,7 +1346,7 @@ int main(int argc, char** argv) {
                         for (const auto& t : snap.records) {
                             if (t.entityId == r.targetId &&
                                 !(t.flags & FLAG_DESTROYED)) {
-                                DrawLine3D(p, recPos(t), los);
+                                DrawLine3D(p, livePos(t), los);
                                 break;
                             }
                         }
@@ -1250,18 +1419,88 @@ int main(int argc, char** argv) {
 
         if (tracking) {
             std::snprintf(line, sizeof(line), "FOLLOWING #%lld", followId);
-            DT(line, screenW - 240, 40, 20, GREEN);
+            DT(line, screenW - 240, 112, 20, GREEN);
+        }
+
+        // --- Render-FPS control: slider + integer text box (0..1000, 0=uncapped).
+        // Both widgets are views of targetFps; setFps() is the only writer, so a
+        // drag and a typed value can never disagree.
+        {
+            const Rectangle track{ panelRect.x + 14, panelRect.y + 54, 150, 6 };
+            const Rectangle box{ track.x + track.width + 16, track.y - 10, 58, 26 };
+            const float frac = targetFps / 1000.0f;
+            const float knobX = track.x + frac * track.width;
+            const Rectangle knob{ knobX - 6.0f, track.y - 7.0f, 12.0f, 20.0f };
+
+            // Slider: grab on the knob or anywhere along the track, then follow the
+            // pointer (even if it slides off the track) until the button releases.
+            const Rectangle grab{ track.x - 6.0f, track.y - 8.0f,
+                                  track.width + 12.0f, 22.0f };
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+                (CheckCollisionPointRec(mousePos, knob) ||
+                 CheckCollisionPointRec(mousePos, grab))) {
+                fpsSliderDrag = true;
+                fpsBoxEditing = false;
+            }
+            if (fpsSliderDrag) {
+                if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                    const float f = Clamp((mousePos.x - track.x) / track.width,
+                                          0.0f, 1.0f);
+                    setFps(static_cast<int>(std::lround(f * 1000.0f)));
+                } else {
+                    fpsSliderDrag = false;
+                }
+            }
+
+            // Text box: click to focus, type digits, Enter/click-away commits.
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                const bool hitBox = CheckCollisionPointRec(mousePos, box);
+                if (fpsBoxEditing && !hitBox) commitFpsBox(); // click-away commits
+                fpsBoxEditing = hitBox;
+                if (hitBox) fpsBoxText.clear(); // start fresh on focus
+            }
+            if (fpsBoxEditing) {
+                for (int key = GetCharPressed(); key > 0; key = GetCharPressed())
+                    if (key >= '0' && key <= '9' && fpsBoxText.size() < 4)
+                        fpsBoxText.push_back(static_cast<char>(key));
+                if (IsKeyPressed(KEY_BACKSPACE) && !fpsBoxText.empty())
+                    fpsBoxText.pop_back();
+                if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+                    commitFpsBox();
+                    fpsBoxEditing = false;
+                }
+            }
+
+            // Draw the panel.
+            DrawRectangleRec(panelRect, Color{0, 0, 0, 160});
+            DrawRectangleLinesEx(panelRect, 1.0f, Color{40, 60, 90, 255});
+            DT("DISPLAY", static_cast<int>(panelRect.x) + 14,
+               static_cast<int>(panelRect.y) + 8, 18, RAYWHITE);
+            DT(targetFps == 0 ? "render cap : uncapped" : "render cap",
+               static_cast<int>(panelRect.x) + 14,
+               static_cast<int>(panelRect.y) + 30, 14, LIGHTGRAY);
+            DrawRectangleRec(track, Color{60, 70, 90, 255});
+            DrawRectangle(static_cast<int>(track.x), static_cast<int>(track.y),
+                          static_cast<int>(frac * track.width),
+                          static_cast<int>(track.height), Color{0, 150, 190, 255});
+            DrawRectangleRec(knob, fpsSliderDrag ? SKYBLUE : RAYWHITE);
+            DrawRectangleRec(box, Color{20, 26, 36, 255});
+            DrawRectangleLinesEx(box, 1.0f,
+                                 fpsBoxEditing ? SKYBLUE : Color{70, 80, 100, 255});
+            const std::string shown = fpsBoxEditing ? fpsBoxText + "_" : fpsBoxText;
+            DT(shown.c_str(), static_cast<int>(box.x) + 6,
+               static_cast<int>(box.y) + 5, 16, RAYWHITE);
         }
 
         // --- Hover ring: encircle the missile under the cursor and label its
         // allegiance (ENEMY / ALLY / DOMESTIC). One missile at a time, and only
         // while not orbiting (a drag would make the pointer position meaningless).
         if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
-            !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+            !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && !overPanel) {
             const int hov = pickNearestMissile(GetMousePosition(), 45.0f);
             if (hov >= 0) {
                 const TelemetryRecord& r = snap.records[hov];
-                const Vector2 s = GetWorldToScreen(recPos(r), cam.toCamera());
+                const Vector2 s = GetWorldToScreen(livePos(r), cam.toCamera());
                 const Color col = trackColor(r);
                 DrawRing(s, 18.0f, 21.0f, 0.0f, 360.0f, 48, col);
                 DrawRing(s, 21.0f, 22.5f, 0.0f, 360.0f, 48, ColorAlpha(BLACK, 0.5f));
