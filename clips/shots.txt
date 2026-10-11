@@ -1,0 +1,64 @@
+# Showcase shot list for c2_visualizer --clips (see the header of src/c2_visualizer.cpp).
+#   clip <name> <start s> <length s> [speed]
+#   key  <t> <yaw deg> <pitch deg> <dist km> <tx> <ty> <tz>
+#   follow <entityId>   (target xyz becomes an offset from the track)
+#   fov <deg>           (vertical field of view, default 55)
+
+# Wide establishing orbit: the raid launches and the battery answers.
+clip 01_raid_overview 0 12 1.5
+key 0  15 30 40 0 5 0
+key 12 70 18 28 0 4 0
+end
+
+# Low over the deck as the standing battery and demand launches climb out.
+clip 02_battery_launch 0.2 9 1.0
+key 0 200 5 20 0 1.2 0
+key 9 235 14 26 0 3.5 0
+end
+
+# Chase a hostile down to its intercept over Manhattan, half speed.
+clip 03_hostile_intercept 44.6 11 0.5
+follow 64
+key 0  30 14 3.2 0 0 0
+key 11 75 22 4.5 0 0 0
+end
+
+# Ride interceptor #102 through its terminal homing to the kill, half speed.
+clip 04_interceptor_terminal 41.3 9 0.5
+follow 102
+key 0 150 12 1.8 0 0 0
+key 9 105 22 3.2 0 0 0
+end
+
+# Orbit the defended city through the heaviest exchange, double speed.
+clip 05_city_defense_orbit 28 15 2.0
+key 0  -20 26 40 0 4 0
+key 7  40 20 32 0 5 0
+key 15 110 30 38 0 4 0
+end
+
+# Tactical top-down of the whole engagement, triple speed.
+clip 06_tactical_overhead 16 14 3.0
+key 0  0 84 50 0 0 0
+key 14 25 78 44 0 0 0
+end
+
+# Low over the UN skyline while the last leakers are killed close in.
+clip 07_skyline_close 47 9 1.0
+key 0 140 7 13 2 2.2 -3
+key 9 195 11 10 2 2.6 -3
+end
+
+# Ground orbit just outside the battery ring, looking in and up at the city as
+# the rounds launch and pitch over toward the raid. 0.3x slow motion; keys every 2 s on the arc.
+# A long lens (14 deg) from 7 km back compresses the skyline up behind the rounds.
+clip 08_ground_launch_orbit 0 12 0.3
+fov 14
+key 0 150.0 -4.0 8.52 4.750 0.744 -8.227
+key 2 162.5 -4.0 8.52 2.857 0.744 -9.060
+key 4 175.0 -4.0 8.52 0.828 0.744 -9.464
+key 6 187.5 -4.0 8.52 -1.240 0.744 -9.419
+key 8 200.0 -4.0 8.52 -3.249 0.744 -8.927
+key 10 212.5 -4.0 8.52 -5.104 0.744 -8.012
+key 12 225.0 -4.0 8.52 -6.718 0.744 -6.718
+end

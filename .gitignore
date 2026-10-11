@@ -37,3 +37,9 @@ un_buildings*.json
 un_raw.json
 un_water.json
 *_try.json
+
+# Clip capture output from c2_visualizer (videos, saved runs). The example shot
+# list clips/shots.txt IS committed.
+clips/*.mp4
+clips/*.drec
+clips/*.log

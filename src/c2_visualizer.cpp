@@ -10,6 +10,14 @@
 //   c2_visualizer --source shm [--shm /defsim_telemetry]
 //   c2_visualizer --source udp [--port 9090]
 //   c2_visualizer ... --frames N --screenshot out.png   (headless/CI capture)
+//   c2_visualizer ... --save-rec run.drec                (keep the run for replay)
+//   c2_visualizer --replay run.drec                      (scrub a saved run, no sim)
+//   c2_visualizer --replay run.drec --clips shots.txt [--out clips] [--size 1920x1080]
+//                                                        (render scripted clips)
+//
+// Clip capture: [H] hides every overlay (clean feed); [R] starts/stops recording
+// the clean 3D scene to clips/clip_NNN.mp4 through ffmpeg (which must be on PATH).
+// Frames are grabbed before the HUD is drawn, so recordings never carry the GUI.
 
 #include <algorithm>
 #include <cmath>
@@ -20,7 +28,6 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "raylib.h"
@@ -320,6 +327,7 @@ struct OrbitCamera {
     float   distance{30.0f};          // frames the UN skyline and the raid
     float   yaw{0.7f};
     float   pitch{0.62f};             // low enough to see the skyline in profile
+    float   fovy{55.0f};              // vertical field of view (deg)
 
     Camera3D toCamera() const {
         Camera3D cam{};
@@ -330,7 +338,7 @@ struct OrbitCamera {
             target.z + distance * cp * cosf(yaw)};
         cam.target   = target;
         cam.up       = Vector3{0.0f, 1.0f, 0.0f};
-        cam.fovy     = 55.0f;
+        cam.fovy     = fovy;
         cam.projection = CAMERA_PERSPECTIVE;
         return cam;
     }
@@ -384,6 +392,20 @@ struct TrailPt {
     bool    hot{false};
 };
 
+// One captured telemetry frame, retained for the whole run so the visualizer can
+// pause, scrub, and replay any moment entirely locally: the producer is never
+// contacted, we simply keep every frame the live feed hands us. The display is a
+// pure function of a position in this timeline, so trails and detonations replay
+// coherently no matter where the scrubber sits.
+struct RecFrame {
+    double                                     frame{0.0};   // producer frameId
+    std::vector<TelemetryRecord>               records;      // full snapshot
+    std::unordered_map<std::uint32_t, Vector3> pos;          // live positions (O(1) interp)
+    std::vector<Vector3>                       dets;         // detonations that fired here
+    int                                        interceptCount{0}; // cumulative at this frame
+    int                                        assetLosses{0};    // cumulative at this frame
+};
+
 bool isHostile(const TelemetryRecord& r) {
     return r.entityType == static_cast<std::uint8_t>(sim::EntityType::Hostile);
 }
@@ -434,6 +456,13 @@ struct Options {
     int         maxFrames{0};      // 0 = run until window closed
     std::string screenshot;        // capture on exit if set
     float       distance{0.0f};    // initial camera distance (0 = default)
+    bool        clean{false};      // start with every overlay hidden
+    std::string saveRec;           // write the captured run here on exit
+    std::string replay;            // load a saved run instead of connecting
+    std::string clipsFile;         // scripted clip list to render, then exit
+    std::string outDir{"clips"};   // where recordings and scripted clips land
+    int         width{1280};       // window (and clip) size
+    int         height{720};
 };
 
 Options parseArgs(int argc, char** argv) {
@@ -449,8 +478,228 @@ Options parseArgs(int argc, char** argv) {
         else if (a == "--frames")     o.maxFrames = std::stoi(next("0"));
         else if (a == "--screenshot") o.screenshot = next("");
         else if (a == "--dist")       o.distance = std::stof(next("0"));
+        else if (a == "--clean")      o.clean = true;
+        else if (a == "--save-rec")   o.saveRec = next("");
+        else if (a == "--replay")     o.replay = next("");
+        else if (a == "--clips")      o.clipsFile = next("");
+        else if (a == "--out")        o.outDir = next("clips");
+        else if (a == "--size") {
+            const std::string s = next("1280x720");
+            int w = 0, h = 0;
+            if (std::sscanf(s.c_str(), "%dx%d", &w, &h) == 2 && w >= 320 && h >= 240) {
+                o.width = w;
+                o.height = h;
+            }
+        }
     }
     return o;
+}
+
+// --- Saved runs ----------------------------------------------------------------
+// A run is the raw telemetry stream, frame by frame, so a replay rebuilds exactly
+// what the live feed delivered (positions, detonation flags, score) and every
+// derived view follows from it. Layout: 8-byte magic, u32 frame count, then per
+// frame a u64 frameId, u32 interceptCount, u32 recordCount and the packed records.
+constexpr char kRecMagic[8] = {'D', 'S', 'R', 'E', 'C', '0', '0', '1'};
+
+struct RawFrame {
+    std::uint64_t                frameId{0};
+    std::uint32_t                interceptCount{0};
+    std::vector<TelemetryRecord> records;
+};
+
+bool saveRun(const std::string& path, const std::vector<RawFrame>& frames) {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const auto n = static_cast<std::uint32_t>(frames.size());
+    bool ok = std::fwrite(kRecMagic, 1, sizeof(kRecMagic), f) == sizeof(kRecMagic) &&
+              std::fwrite(&n, sizeof(n), 1, f) == 1;
+    for (const RawFrame& fr : frames) {
+        if (!ok) break;
+        const auto rc = static_cast<std::uint32_t>(fr.records.size());
+        ok = std::fwrite(&fr.frameId, sizeof(fr.frameId), 1, f) == 1 &&
+             std::fwrite(&fr.interceptCount, sizeof(fr.interceptCount), 1, f) == 1 &&
+             std::fwrite(&rc, sizeof(rc), 1, f) == 1 &&
+             (rc == 0 || std::fwrite(fr.records.data(), sizeof(TelemetryRecord), rc, f) == rc);
+    }
+    return std::fclose(f) == 0 && ok;
+}
+
+bool loadRun(const std::string& path, std::vector<RawFrame>& frames) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char magic[8];
+    std::uint32_t n = 0;
+    bool ok = std::fread(magic, 1, sizeof(magic), f) == sizeof(magic) &&
+              std::memcmp(magic, kRecMagic, sizeof(magic)) == 0 &&
+              std::fread(&n, sizeof(n), 1, f) == 1;
+    frames.clear();
+    for (std::uint32_t i = 0; ok && i < n; ++i) {
+        RawFrame fr;
+        std::uint32_t rc = 0;
+        ok = std::fread(&fr.frameId, sizeof(fr.frameId), 1, f) == 1 &&
+             std::fread(&fr.interceptCount, sizeof(fr.interceptCount), 1, f) == 1 &&
+             std::fread(&rc, sizeof(rc), 1, f) == 1 && rc < 1000000u;
+        if (!ok) break;
+        fr.records.resize(rc);
+        ok = rc == 0 || std::fread(fr.records.data(), sizeof(TelemetryRecord), rc, f) == rc;
+        if (ok) frames.push_back(std::move(fr));
+    }
+    std::fclose(f);
+    return ok && !frames.empty();
+}
+
+// --- Clip capture ----------------------------------------------------------------
+// Raw RGBA frames are piped into ffmpeg, which encodes H.264 on the fly, so a
+// recording never touches disk as images. One writer per clip.
+#ifdef _WIN32
+#define SIM_POPEN  _popen
+#define SIM_PCLOSE _pclose
+#else
+#define SIM_POPEN  popen
+#define SIM_PCLOSE pclose
+#endif
+
+struct ClipWriter {
+    std::FILE*  pipe{nullptr};
+    int         w{0}, h{0};
+    int         frames{0};
+    std::string path;
+
+    bool open(const std::string& out, int width, int height) {
+        // yuv420p needs even dimensions; crop a stray odd row/column if present.
+        w = width & ~1;
+        h = height & ~1;
+        if (w <= 0 || h <= 0) return false;
+        path = out;
+        frames = 0;
+        char cmd[1024];
+        std::snprintf(cmd, sizeof(cmd),
+            "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgba -s %dx%d -r 60 -i - "
+            "-c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p -movflags +faststart \"%s\"",
+            w, h, out.c_str());
+#ifdef _WIN32
+        pipe = SIM_POPEN(cmd, "wb");
+#else
+        pipe = SIM_POPEN(cmd, "w");
+#endif
+        return pipe != nullptr;
+    }
+    // Grab the currently bound framebuffer (call after the 3D pass, before the
+    // HUD) and hand it to the encoder.
+    void grab() {
+        if (!pipe) return;
+        unsigned char* px = rlReadScreenPixels(GetRenderWidth(), GetRenderHeight());
+        if (!px) return;
+        const int stride = GetRenderWidth() * 4;
+        for (int y = 0; y < h; ++y)
+            std::fwrite(px + static_cast<std::size_t>(y) * stride, 1,
+                        static_cast<std::size_t>(w) * 4, pipe);
+        RL_FREE(px);
+        ++frames;
+    }
+    void close() {
+        if (pipe) SIM_PCLOSE(pipe);
+        pipe = nullptr;
+    }
+    bool active() const { return pipe != nullptr; }
+};
+
+// --- Scripted clips -------------------------------------------------------------
+// A clip is a window of the run plus a camera path. The script is plain text:
+//
+//   clip <name> <start s> <length s> [playback speed]
+//   key <t s> <yaw deg> <pitch deg> <distance km> <target x> <target y> <target z>
+//   ...more keys (t is output time within the clip)...
+//   follow <entityId>        (optional: the target rides this track, xyz = offset)
+//   fov <deg>                (optional: vertical field of view, default 55)
+//   end
+//
+// Keys are joined by a Catmull-Rom spline, so multi-key moves glide through each
+// key instead of stopping on it. '#' starts a comment.
+struct CamKey { float t, yaw, pitch, dist; Vector3 target; };
+
+struct ClipSpec {
+    std::string         name;
+    double              start{0.0};  // seconds into the run
+    double              length{5.0}; // output seconds
+    double              speed{1.0};  // run seconds per output second
+    long long           follow{-1};
+    float               fov{55.0f};  // vertical field of view (deg)
+    std::vector<CamKey> keys;
+};
+
+std::vector<ClipSpec> loadClips(const std::string& path) {
+    std::vector<ClipSpec> clips;
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return clips;
+    char buf[512];
+    ClipSpec cur;
+    bool open = false;
+    while (std::fgets(buf, sizeof(buf), f)) {
+        if (char* hash = std::strchr(buf, '#')) *hash = '\0';
+        char word[32] = {0};
+        if (std::sscanf(buf, "%31s", word) != 1) continue;
+        const std::string w = word;
+        if (w == "clip") {
+            cur = ClipSpec{};
+            char name[128] = {0};
+            double speed = 1.0;
+            const int got = std::sscanf(buf, "%*s %127s %lf %lf %lf", name,
+                                        &cur.start, &cur.length, &speed);
+            if (got >= 3) { cur.name = name; cur.speed = (got == 4) ? speed : 1.0; open = true; }
+        } else if (w == "key" && open) {
+            CamKey k{};
+            if (std::sscanf(buf, "%*s %f %f %f %f %f %f %f", &k.t, &k.yaw, &k.pitch,
+                            &k.dist, &k.target.x, &k.target.y, &k.target.z) == 7) {
+                k.yaw *= DEG2RAD;
+                k.pitch *= DEG2RAD;
+                cur.keys.push_back(k);
+            }
+        } else if (w == "fov" && open) {
+            float fov = 55.0f;
+            if (std::sscanf(buf, "%*s %f", &fov) == 1) cur.fov = Clamp(fov, 5.0f, 120.0f);
+        } else if (w == "follow" && open) {
+            std::sscanf(buf, "%*s %lld", &cur.follow);
+        } else if (w == "end" && open) {
+            if (!cur.keys.empty()) {
+                std::sort(cur.keys.begin(), cur.keys.end(),
+                          [](const CamKey& a, const CamKey& b) { return a.t < b.t; });
+                clips.push_back(cur);
+            }
+            open = false;
+        }
+    }
+    std::fclose(f);
+    return clips;
+}
+
+// Camera pose at output time t: a uniform Catmull-Rom through the keys, with the
+// ends clamped, so the motion is C1-continuous through every interior key.
+CamKey sampleKeys(const std::vector<CamKey>& keys, float t) {
+    if (keys.size() == 1 || t <= keys.front().t) return keys.front();
+    if (t >= keys.back().t) return keys.back();
+    std::size_t i = 0;
+    while (i + 2 < keys.size() && t > keys[i + 1].t) ++i;
+    const CamKey& p1 = keys[i];
+    const CamKey& p2 = keys[i + 1];
+    const CamKey& p0 = (i > 0) ? keys[i - 1] : p1;
+    const CamKey& p3 = (i + 2 < keys.size()) ? keys[i + 2] : p2;
+    const float u = Clamp((t - p1.t) / std::max(1e-4f, p2.t - p1.t), 0.0f, 1.0f);
+    auto cr = [u](float a, float b, float c, float d) {
+        const float u2 = u * u, u3 = u2 * u;
+        return 0.5f * (2.0f * b + (c - a) * u + (2.0f * a - 5.0f * b + 4.0f * c - d) * u2 +
+                       (3.0f * b - a - 3.0f * c + d) * u3);
+    };
+    CamKey k{};
+    k.t        = t;
+    k.yaw      = cr(p0.yaw, p1.yaw, p2.yaw, p3.yaw);
+    k.pitch    = cr(p0.pitch, p1.pitch, p2.pitch, p3.pitch);
+    k.dist     = cr(p0.dist, p1.dist, p2.dist, p3.dist);
+    k.target.x = cr(p0.target.x, p1.target.x, p2.target.x, p3.target.x);
+    k.target.y = cr(p0.target.y, p1.target.y, p2.target.y, p3.target.y);
+    k.target.z = cr(p0.target.z, p1.target.z, p2.target.z, p3.target.z);
+    return k;
 }
 
 std::unique_ptr<ITelemetryConsumer> makeConsumer(const Options& o) {
@@ -474,8 +723,11 @@ int main(int argc, char** argv) {
     // Resizable window; the framebuffer (and thus the render resolution) tracks the
     // window size, and screenW/screenH are refreshed every frame from it. F11
     // toggles borderless fullscreen.
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-    int screenW = 1280, screenH = 720;
+    // Scripted clip rendering pins the window to the clip size and turns on 4x
+    // MSAA so the hairline trails and grid encode cleanly.
+    const bool scripted = !opt.clipsFile.empty();
+    SetConfigFlags(scripted ? FLAG_MSAA_4X_HINT : FLAG_WINDOW_RESIZABLE);
+    int screenW = opt.width, screenH = opt.height;
     InitWindow(screenW, screenH, "Defense Simulation - C2 Tactical Display");
     SetWindowMinSize(800, 480);
     SetTargetFPS(60);
@@ -502,9 +754,27 @@ int main(int argc, char** argv) {
                    static_cast<float>(sz), 1.0f, c);
     };
 
+    // A saved run replaces the live feed entirely: no producer is contacted.
+    std::vector<RawFrame> rawRun; // every frame as delivered (replayed or captured)
+    if (!opt.replay.empty() && !loadRun(opt.replay, rawRun)) {
+        CloseWindow();
+        std::fprintf(stderr, "could not load run '%s'\n", opt.replay.c_str());
+        return 1;
+    }
+    const bool replaying = !rawRun.empty();
+    std::vector<ClipSpec> clipSpecs;
+    if (scripted) {
+        clipSpecs = loadClips(opt.clipsFile);
+        if (clipSpecs.empty()) {
+            CloseWindow();
+            std::fprintf(stderr, "no clips in '%s'\n", opt.clipsFile.c_str());
+            return 1;
+        }
+    }
+
     // Connect to the telemetry source (retry briefly for shm/producer startup).
     std::unique_ptr<ITelemetryConsumer> consumer;
-    for (int attempt = 0; attempt < 50 && !WindowShouldClose(); ++attempt) {
+    for (int attempt = 0; attempt < 50 && !replaying && !WindowShouldClose(); ++attempt) {
         try {
             consumer = makeConsumer(opt);
             if (consumer) break;
@@ -517,8 +787,7 @@ int main(int argc, char** argv) {
         EndDrawing();
         WaitTime(0.1);
     }
-    if (!consumer) {
-        if (!opt.screenshot.empty()) { /* fall through to allow headless exit */ }
+    if (!consumer && !replaying) {
         CloseWindow();
         std::fprintf(stderr, "could not create telemetry consumer\n");
         return 1;
@@ -526,10 +795,50 @@ int main(int argc, char** argv) {
 
     OrbitCamera cam;
     if (opt.distance > 0.0f) cam.distance = Clamp(opt.distance, 1.0f, 400.0f);
-    TelemetrySnapshot snap;
-    std::unordered_map<std::uint32_t, std::deque<TrailPt>> trails;
-    std::unordered_map<std::uint32_t, double> trailSeen; // wall-clock last update
-    std::vector<Detonation> detonations;
+    TelemetrySnapshot snap;               // scratch for the newest polled frame
+    std::deque<RecFrame> recording;       // every captured frame (whole-run history)
+    std::unordered_map<std::uint32_t, std::deque<TrailPt>> trails; // rebuilt per render
+    std::vector<Detonation> detonations;  // rebuilt per render from `recording`
+    int assetLossesRun = 0;               // running cumulative, stamped into each RecFrame
+    // Cap the retained history so a very long session cannot grow without bound;
+    // 60 Hz for ~30 min. Scrubbing simply cannot reach before the retained window.
+    constexpr std::size_t kMaxRecFrames = 108000;
+
+    // Capture one frame so any moment can be replayed locally: live positions for
+    // interpolation, the raw records for rendering/picking, the detonations that
+    // fired this frame, and the cumulative score so the HUD reads true at whatever
+    // T the scrubber selects. A frame id that goes backwards means the producer
+    // restarted, so the old run is dropped rather than interleaved with the new.
+    auto appendFrame = [&](std::uint64_t frameIdRaw, std::uint32_t interceptCount,
+                           const std::vector<TelemetryRecord>& records) {
+        const double frameId = static_cast<double>(frameIdRaw);
+        if (!recording.empty() && frameId <= recording.back().frame) {
+            recording.clear();
+            assetLossesRun = 0;
+            if (!replaying) rawRun.clear();
+        }
+        RecFrame rf;
+        rf.frame = frameId;
+        rf.records = records;
+        rf.pos.reserve(records.size());
+        for (const auto& rr : records) {
+            if (rr.flags & FLAG_DESTROYED) {
+                rf.dets.push_back(recPos(rr));
+                if (rr.flags & FLAG_ASSET_HIT) ++assetLossesRun;
+            } else {
+                rf.pos[rr.entityId] = recPos(rr);
+            }
+        }
+        rf.interceptCount = static_cast<int>(interceptCount);
+        rf.assetLosses = assetLossesRun;
+        recording.push_back(std::move(rf));
+        while (recording.size() > kMaxRecFrames) recording.pop_front();
+        if (!replaying && !opt.saveRec.empty()) {
+            rawRun.push_back(RawFrame{frameIdRaw, interceptCount, records});
+            while (rawRun.size() > kMaxRecFrames) rawRun.erase(rawRun.begin());
+        }
+    };
+    for (const RawFrame& fr : rawRun) appendFrame(fr.frameId, fr.interceptCount, fr.records);
 
     // Static defended city: the real UN HQ + Midtown Manhattan, loaded 1:1 from
     // the binary map asset and drawn as flyweight instances -- two shared meshes
@@ -748,8 +1057,6 @@ int main(int argc, char** argv) {
     // moving far is a pick (select a missile); a moving press orbits the camera.
     Vector2 pressPos{0.0f, 0.0f};
     float    pressDrag = 0.0f;
-    int neutralizedPeak = 0;
-    int assetLosses = 0; // leaked threats that struck the city (running total)
     int frameCounter = 0;
 
     // Stage-3 render toggles + per-frame instrumentation so the culling win is
@@ -786,22 +1093,31 @@ int main(int argc, char** argv) {
     // arrival detection) avoids folding render-frame jitter in. A short history is
     // kept so the target is always bracketed even when arrivals are uneven; frame
     // gaps from the render outrunning telemetry are absorbed by the bracket span.
-    struct Snap { double frame; std::unordered_map<std::uint32_t, Vector3> pos; };
-    std::deque<Snap> hist;             // oldest..newest, keyed by frame id
+    // Playback timeline. The whole run lives in `recording`; the displayed world
+    // is a pure function of playF, a position in producer frame-id space. While
+    // "live" playF chases the newest captured frame (a fixed delay behind, played
+    // back at the smoothed production rate). Paused or scrubbing, the user owns it,
+    // and the same frame-index interpolation renders any moment smoothly.
     double rateEma       = 60.0;       // telemetry frames/sec in real time
     double newestArrival = 0.0;        // GetTime() when the newest snapshot landed
     double playF         = 0.0;        // playback position in frame-id space
     bool   havePlay      = false;
     bool   haveArrival   = false;
-    const Snap* loSnap = nullptr;      // interpolation bracket, refreshed per frame
-    const Snap* hiSnap = nullptr;
-    float  interpAlpha = 0.0f;         // position within [loSnap, hiSnap]
+    bool   paused        = false;      // transport frozen (for framing a shot)
+    bool   live          = true;       // playF chases the tail (vs. replay after a scrub)
+    int    loIdx = -1, hiIdx = -1;     // interpolation bracket into `recording`
+    float  interpAlpha = 0.0f;         // position within [loIdx, hiIdx]
+    // Records of the frame currently on screen (the bracket's low frame); every
+    // render and pick reads through this, so a scrub redraws the whole scene at
+    // that moment. Points at the live snapshot only until the first frame lands.
+    const std::vector<TelemetryRecord>* viewRecs = nullptr;
     auto livePos = [&](const TelemetryRecord& r) -> Vector3 {
-        const Vector3 cur = recPos(r); // fall back to the raw latest sample
-        if (loSnap == nullptr || hiSnap == nullptr) return cur;
-        const auto lo = loSnap->pos.find(r.entityId);
-        const auto hi = hiSnap->pos.find(r.entityId);
-        if (lo == loSnap->pos.end() || hi == hiSnap->pos.end()) return cur;
+        const Vector3 cur = recPos(r); // fall back to the raw sample
+        if (loIdx < 0 || hiIdx < 0) return cur;
+        const auto lo = recording[loIdx].pos.find(r.entityId);
+        const auto hi = recording[hiIdx].pos.find(r.entityId);
+        if (lo == recording[loIdx].pos.end() || hi == recording[hiIdx].pos.end())
+            return cur;
         return Vector3Lerp(lo->second, hi->second, interpAlpha);
     };
 
@@ -812,10 +1128,11 @@ int main(int argc, char** argv) {
     auto pickNearestMissile = [&](Vector2 sp, float maxPx) -> int {
         const Camera3D c3 = cam.toCamera();
         const Vector3 fwd = Vector3Normalize(Vector3Subtract(c3.target, c3.position));
+        const std::vector<TelemetryRecord>& recs = viewRecs ? *viewRecs : snap.records;
         int best = -1;
         float bestD2 = maxPx * maxPx;
-        for (int i = 0; i < static_cast<int>(snap.records.size()); ++i) {
-            const TelemetryRecord& r = snap.records[i];
+        for (int i = 0; i < static_cast<int>(recs.size()); ++i) {
+            const TelemetryRecord& r = recs[i];
             if (r.flags & FLAG_DESTROYED) continue;
             if (!isHostile(r) && !isInterceptor(r)) continue;
             const Vector3 wp = livePos(r);
@@ -837,6 +1154,7 @@ int main(int argc, char** argv) {
     // single writer, so the two widgets never disagree.
     int  targetFps      = 60;      // current render cap; 0 = uncapped
     bool fpsSliderDrag  = false;   // the slider knob is being dragged
+    bool scrubDrag      = false;   // the timeline scrubber is being dragged
     bool fpsBoxEditing  = false;   // the integer text box has keyboard focus
     std::string fpsBoxText = "60"; // live text mirror of targetFps
     auto setFps = [&](int f) {
@@ -852,6 +1170,33 @@ int main(int argc, char** argv) {
         // jumps to uncapped); to actually set 0 the user types the digit '0'.
         if (!fpsBoxText.empty()) setFps(std::stoi(fpsBoxText));
         fpsBoxText = std::to_string(targetFps);
+    };
+
+    // --- Clip capture state ----------------------------------------------------
+    // showUi gates every 2D overlay ([H]). An interactive recording ([R]) grabs the
+    // frame after the 3D pass, so the GUI stays on screen but never in the file,
+    // and while it runs the timeline steps exactly one telemetry frame per video
+    // frame, so the clip plays at true speed whatever the render rate. Scripted
+    // clips do the same with the camera driven by the clip's keys.
+    bool showUi = !opt.clean && !scripted;
+    ClipWriter writer;
+    int clipSerial = 0;             // next clip_NNN.mp4 for interactive recording
+    std::size_t clipIdx = 0;        // scripted clip being rendered
+    int clipFrame = -1;             // its output frame (-1 = not started)
+    bool runDone = replaying;       // whole run captured; scripted clips may start
+    bool runSaved = false;          // --save-rec written
+    Vector3 followHold{0.0f, 0.0f, 0.0f}; // last seen position of a scripted follow
+    if (replaying) { live = false; paused = !scripted; } // a replay opens on frame 0
+    // Scripted rendering is offline: run uncapped (the capture polls the feed as
+    // often as it can, and clips encode as fast as the GPU renders them).
+    if (scripted) setFps(0);
+    auto nextClipPath = [&]() {
+        MakeDirectory(opt.outDir.c_str());
+        for (;; ++clipSerial) {
+            char p[512];
+            std::snprintf(p, sizeof(p), "%s/clip_%03d.mp4", opt.outDir.c_str(), clipSerial);
+            if (!FileExists(p)) { ++clipSerial; return std::string(p); }
+        }
     };
 
     while (!WindowShouldClose()) {
@@ -873,11 +1218,26 @@ int main(int argc, char** argv) {
                                    12.0f, static_cast<float>(panelW),
                                    static_cast<float>(panelH) };
         const Vector2 mousePos = GetMousePosition();
-        const bool overPanel = CheckCollisionPointRec(mousePos, panelRect);
-        const bool uiActive = overPanel || fpsSliderDrag;
+        const bool overPanel = showUi && CheckCollisionPointRec(mousePos, panelRect);
+
+        // Transport scrubber (bottom bar). Geometry is computed up front so hovering
+        // it (or dragging it) suppresses camera orbit and the click-to-follow pick,
+        // exactly like the display panel; it is drawn and driven in the 2D overlay.
+        const float scrubH = 46.0f;
+        const float scrubY = static_cast<float>(screenH) - scrubH;
+        const Rectangle scrubBar{ 0.0f, scrubY, static_cast<float>(screenW), scrubH };
+        const Rectangle playBtn{ 14.0f, scrubY + 8.0f, 30.0f, 30.0f };
+        const Rectangle liveBtn{ static_cast<float>(screenW) - 74.0f, scrubY + 8.0f,
+                                 60.0f, 30.0f };
+        const float trackX = playBtn.x + playBtn.width + 72.0f; // room for MM:SS
+        const float trackR = liveBtn.x - 78.0f;                 // room for total MM:SS
+        const Rectangle scrubTrack{ trackX, scrubY + 20.0f,
+                                    std::max(10.0f, trackR - trackX), 6.0f };
+        const bool overScrub = showUi && CheckCollisionPointRec(mousePos, scrubBar);
+        const bool uiActive = overPanel || fpsSliderDrag || overScrub || scrubDrag;
 
         // --- Ingest -----------------------------------------------------------
-        const bool haveNew = consumer->PollLatestFrame(snap);
+        const bool haveNew = consumer && consumer->PollLatestFrame(snap);
         const bool freshFrame = haveNew && snap.header.frameId != lastFrameId;
 
         if (freshFrame) {
@@ -892,25 +1252,14 @@ int main(int argc, char** argv) {
             }
             lastTsNs = snap.header.timestampNs;
             lastFrameId = snap.header.frameId;
-            neutralizedPeak = std::max<int>(
-                neutralizedPeak, static_cast<int>(snap.header.interceptCount));
 
-            // Update trails and spawn detonation FX from this frame, collecting
-            // the ids still live this frame so we can prune orphaned trails below.
-            std::unordered_set<std::uint32_t> present;
-            present.reserve(snap.records.size());
             const double now = loopTime;
-
-            // Push this snapshot (producer time base) into the interpolation
-            // history, caching only live tracks (destroyed ones burst as
-            // detonations). A few frames of history are enough to always bracket
-            // the delayed playback time.
             const double frameId = static_cast<double>(snap.header.frameId);
             // Smoothed real-time production rate (frames advanced per second of
             // local time), outlier-guarded. A scalar low-pass, not a feedback loop
             // into the motion, so it cannot ring.
-            if (haveArrival && !hist.empty()) {
-                const double dF = frameId - hist.back().frame;
+            if (haveArrival && !recording.empty()) {
+                const double dF = frameId - recording.back().frame;
                 const double dL = now - newestArrival;
                 if (dL > 1e-4 && dF > 0.0) {
                     const double instRate = dF / dL;
@@ -918,112 +1267,123 @@ int main(int argc, char** argv) {
                         rateEma += (instRate - rateEma) * 0.05;
                 }
             }
-            Snap s;
-            s.frame = frameId;
-            s.pos.reserve(snap.records.size());
-            for (const auto& rr : snap.records)
-                if (!(rr.flags & FLAG_DESTROYED))
-                    s.pos[rr.entityId] = recPos(rr);
-            hist.push_back(std::move(s));
-            while (hist.size() > 8) hist.pop_front();
+
+            if (!recording.empty() && frameId <= recording.back().frame) {
+                havePlay = false; // producer restarted: re-anchor on the new run
+                live = true;
+                paused = false;
+            }
+            appendFrame(snap.header.frameId, snap.header.interceptCount, snap.records);
             newestArrival = now;
             haveArrival = true;
-            for (const auto& r : snap.records) {
-                if (r.flags & FLAG_DESTROYED) {
-                    detonations.push_back(Detonation{recPos(r), 0.0f});
-                    trails.erase(r.entityId);
-                    trailSeen.erase(r.entityId);
-                    if (r.flags & FLAG_ASSET_HIT) ++assetLosses;
-                    continue;
-                }
-                present.insert(r.entityId);
-                auto& tr = trails[r.entityId];
-                tr.push_back(TrailPt{recPos(r), isBooster(r)});
-                if (tr.size() > 60) tr.pop_front();
-                trailSeen[r.entityId] = now;
-            }
-
-            // Prune trails for any entity that is no longer in the frame. Relying
-            // on catching a track's one-frame FLAG_DESTROYED record leaks its trail
-            // whenever that frame is dropped -- PollLatestFrame only ever returns
-            // the newest snapshot, and under load (e.g. two rounds detonating on the
-            // same frame) the destroy frame is easily skipped, stranding the plume
-            // forever. An entity absent from the latest frame is gone, so drop it.
-            for (auto it = trails.begin(); it != trails.end();) {
-                if (present.count(it->first) == 0) {
-                    trailSeen.erase(it->first);
-                    it = trails.erase(it);
-                } else {
-                    ++it;
-                }
-            }
         }
 
-        // Hard "forever" guard, independent of fresh frames: drop any trail not
-        // refreshed within a short wall-clock window. Catches the case the
-        // per-frame prune cannot -- the producer stalling or the run ending, which
-        // otherwise freezes every in-flight plume on screen indefinitely.
-        {
-            constexpr double kTrailTtl = 1.5; // seconds without an update -> drop
-            const double now = GetTime();
-            for (auto it = trails.begin(); it != trails.end();) {
-                const auto s = trailSeen.find(it->first);
-                if (s == trailSeen.end() || now - s->second > kTrailTtl) {
-                    if (s != trailSeen.end()) trailSeen.erase(s);
-                    it = trails.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
-
-        // Advance the playback position in FRAME-INDEX space and pick this frame's
-        // interpolation bracket. playF advances by real frame time times the
-        // smoothed production rate, so on-screen motion is uniform regardless of
-        // render rate; because the axis is frame id (a fixed motion step per frame)
-        // it is immune to the producer's timestamp jitter. A GENTLE first-order
-        // pull keeps playF a fixed delay behind the newest frame to cancel slow
-        // drift; being first order it settles without overshoot, so it cannot ring
-        // (unlike a hard re-anchor, which snaps every frame the rate estimate is
-        // slightly off). Clamping to the buffer ends holds the newest sample on a
-        // stall rather than extrapolating.
-        loSnap = hiSnap = nullptr;
-        if (hist.size() >= 2 && haveArrival) {
-            const std::size_t n = hist.size();
-            const double target = hist.back().frame - 2.5; // frames behind newest
-            if (!havePlay) {
-                playF = target;
+        // --- Transport + interpolation ---------------------------------------
+        // The displayed world is a pure function of playF, a position in producer
+        // frame-id space over the captured recording. LIVE chases the newest frame
+        // (a fixed delay behind, advanced at the smoothed production rate with a
+        // gentle first-order drift trim that settles without ringing, so on-screen
+        // motion stays uniform at any render rate and is immune to the producer's
+        // timestamp jitter). PAUSED freezes playF so the camera can be moved around
+        // a held moment. After a scrub, REPLAY advances at the production rate from
+        // wherever the user left playF until it catches the tail, then relatches.
+        // While a clip is being written the replay instead steps exactly one
+        // telemetry frame (one 60 Hz tick) per video frame, and a scripted clip
+        // sets playF outright from its start time and playback speed.
+        if (!replaying && !runDone && haveArrival && loopTime - newestArrival > 3.0)
+            runDone = true; // the producer has gone quiet: the run is complete
+        const bool clipRendering = scripted && runDone && clipIdx < clipSpecs.size();
+        loIdx = hiIdx = -1;
+        if (!recording.empty()) {
+            const double newest = recording.back().frame;
+            const double oldest = recording.front().frame;
+            const double target = newest - 2.5; // frames behind newest (live edge)
+            if (clipRendering) {
+                const ClipSpec& cs = clipSpecs[clipIdx];
+                const double outT = std::max(0, clipFrame) / 60.0;
+                playF = oldest + (cs.start + outT * cs.speed) * 60.0;
                 havePlay = true;
-            } else {
-                // Carry motion at the smoothed production rate, then apply a gentle
-                // first-order drift trim with a FRAME-RATE-INDEPENDENT gain (dt over
-                // a fixed time constant): a per-frame constant would correct far
-                // harder at high render rates and re-inject the staircase ripple.
+            } else if (!havePlay) {
+                playF = replaying ? oldest : target;
+                havePlay = true;
+            } else if (!paused) {
                 const double dt = GetFrameTime();
-                playF += dt * rateEma;
-                const double tau = 0.2; // seconds; well above the 60 Hz frame step
-                playF += (target - playF) * std::min(1.0, dt / tau);
-            }
-            if (playF < hist.front().frame) playF = hist.front().frame;
-            if (playF > hist.back().frame)  playF = hist.back().frame;
-            for (std::size_t i = 0; i + 1 < n; ++i) {
-                if (playF >= hist[i].frame && playF <= hist[i + 1].frame) {
-                    const double span =
-                        std::max(1e-6, hist[i + 1].frame - hist[i].frame);
-                    loSnap = &hist[i];
-                    hiSnap = &hist[i + 1];
-                    interpAlpha = static_cast<float>((playF - hist[i].frame) / span);
-                    break;
+                playF += (writer.active() && !live) ? 1.0 : dt * rateEma;
+                if (live) {
+                    const double tau = 0.2; // seconds; well above the 60 Hz step
+                    playF += (target - playF) * std::min(1.0, dt / tau);
+                } else if (playF >= target) {
+                    playF = target;
+                    live = true; // caught the live edge; hand back to the tail
                 }
             }
-            if (loSnap == nullptr) { loSnap = hiSnap = &hist.back(); interpAlpha = 1.0f; }
+            if (playF < oldest) playF = oldest;
+            if (playF > newest) playF = newest;
+
+            // Bracket playF between two captured frames. Frames are sorted ascending
+            // and mostly contiguous, so a binary search finds the pair in log time.
+            std::size_t hi = static_cast<std::size_t>(
+                std::upper_bound(recording.begin(), recording.end(), playF,
+                    [](double t, const RecFrame& f) { return t < f.frame; })
+                - recording.begin());
+            if (hi == 0) hi = 1;
+            if (hi >= recording.size()) hi = recording.size() - 1;
+            const std::size_t lo = (hi > 0) ? hi - 1 : 0; // a lone frame brackets itself
+            const double span =
+                std::max(1e-6, recording[hi].frame - recording[lo].frame);
+            loIdx = static_cast<int>(lo);
+            hiIdx = static_cast<int>(hi);
+            interpAlpha = static_cast<float>(
+                Clamp((playF - recording[lo].frame) / span, 0.0, 1.0));
+        }
+
+        // Records of the moment on screen drive every draw and pick below; a scrub
+        // simply moves loIdx, and the whole scene redraws at that instant.
+        const std::vector<TelemetryRecord>& viewRecords =
+            (loIdx >= 0) ? recording[loIdx].records : snap.records;
+        viewRecs = &viewRecords;
+
+        // Rebuild trails from the recording window ending at the displayed frame, so
+        // ribbons replay correctly under scrubbing rather than accumulating live.
+        // Only tracks still alive at that frame keep a ribbon (a track that died a
+        // few frames back must not leave its plume hanging), and each ribbon ends
+        // at the interpolated position so it stays attached to the missile body.
+        trails.clear();
+        if (loIdx >= 0) {
+            const auto& alive = recording[loIdx].pos;
+            const int first = std::max(0, loIdx - 60);
+            for (int i = first; i <= loIdx; ++i)
+                for (const auto& rr : recording[i].records)
+                    if (!(rr.flags & FLAG_DESTROYED) && alive.count(rr.entityId))
+                        trails[rr.entityId].push_back(
+                            TrailPt{recPos(rr), isBooster(rr)});
+            for (const auto& rr : viewRecords) {
+                const auto it = trails.find(rr.entityId);
+                if (it != trails.end())
+                    it->second.push_back(TrailPt{livePos(rr), isBooster(rr)});
+            }
+        }
+
+        // Rebuild detonations visible at the displayed frame: any that fired within
+        // ~1.2 s (72 frames) before playF, aged by how far behind playF they sit.
+        detonations.clear();
+        if (loIdx >= 0) {
+            constexpr double kDetLifeF = 72.0; // ~1.2 s at 60 Hz
+            const int first = std::max(0, loIdx - static_cast<int>(kDetLifeF));
+            for (int i = first; i <= loIdx; ++i) {
+                const double ageF = playF - recording[i].frame;
+                if (ageF < 0.0 || ageF > kDetLifeF) continue;
+                const float age = static_cast<float>(ageF / 60.0);
+                for (const auto& dp : recording[i].dets)
+                    detonations.push_back(Detonation{dp, age});
+            }
         }
 
         // --- Trackable set (hostiles then interceptors) for Tab-cycling -------
         std::vector<std::uint32_t> trackables;
-        for (const auto& r : snap.records)
+        for (const auto& r : viewRecords)
             if (isHostile(r) && !(r.flags & FLAG_DESTROYED)) trackables.push_back(r.entityId);
-        for (const auto& r : snap.records)
+        for (const auto& r : viewRecords)
             if (isInterceptor(r) && r.targetId != kNoTargetId) trackables.push_back(r.entityId);
 
         // Left-click to follow the missile under the cursor; a press that drags is
@@ -1040,7 +1400,7 @@ int main(int argc, char** argv) {
             !uiActive) {
             const int hit = pickNearestMissile(pressPos, 32.0f);
             if (hit >= 0) {
-                followId = static_cast<long long>(snap.records[hit].entityId);
+                followId = static_cast<long long>(viewRecords[hit].entityId);
                 cam.distance = 3.0f; // zoom in on the selected missile
             }
         }
@@ -1060,12 +1420,69 @@ int main(int argc, char** argv) {
         if (IsKeyPressed(KEY_P)) depthPrepass = !depthPrepass;
         if (IsKeyPressed(KEY_L)) lod = !lod;
         if (IsKeyPressed(KEY_B)) staticInst = !staticInst;
+        // Transport: Space freezes/resumes the timeline for framing a shot; End
+        // jumps back to the live edge (resume chasing the newest telemetry).
+        // Pausing the live feed drops out of live-follow, DVR style: resuming plays
+        // on from the held moment instead of fast-forwarding to catch the tail.
+        if (IsKeyPressed(KEY_SPACE)) { paused = !paused; if (paused) live = false; }
+        if (IsKeyPressed(KEY_END))  { paused = false; live = true; }
+        // Clip capture: [H] clean feed, [R] start/stop recording the 3D scene.
+        if (IsKeyPressed(KEY_H)) showUi = !showUi;
+        if (!scripted && IsKeyPressed(KEY_R)) {
+            if (writer.active()) {
+                writer.close();
+                TraceLog(LOG_WARNING, "clip saved: %s (%d frames)",
+                         writer.path.c_str(), writer.frames);
+            } else if (!writer.open(nextClipPath(), GetRenderWidth(), GetRenderHeight())) {
+                TraceLog(LOG_WARNING, "could not start ffmpeg (is it on PATH?)");
+            }
+        }
+        // A resize mid-clip would change the frame size under the encoder.
+        if (writer.active() && !scripted &&
+            ((GetRenderWidth() & ~1) != writer.w || (GetRenderHeight() & ~1) != writer.h)) {
+            writer.close();
+            TraceLog(LOG_WARNING, "window resized: clip saved: %s", writer.path.c_str());
+        }
+
+        // Scripted clip: the camera rides the clip's keyed path (optionally around
+        // a followed track), and the encoder opens on the clip's first frame.
+        if (clipRendering) {
+            const ClipSpec& cs = clipSpecs[clipIdx];
+            if (clipFrame < 0) {
+                clipFrame = 0;
+                MakeDirectory(opt.outDir.c_str());
+                const std::string path = opt.outDir + "/" + cs.name + ".mp4";
+                if (!writer.open(path, GetRenderWidth(), GetRenderHeight())) {
+                    std::fprintf(stderr, "could not start ffmpeg for %s\n", path.c_str());
+                    break;
+                }
+                followHold = Vector3{0.0f, 0.0f, 0.0f};
+            }
+            const CamKey k = sampleKeys(cs.keys, clipFrame / 60.0f);
+            Vector3 anchor{0.0f, 0.0f, 0.0f};
+            if (cs.follow >= 0 && loIdx >= 0) {
+                const auto id = static_cast<std::uint32_t>(cs.follow);
+                const auto lo = recording[loIdx].pos.find(id);
+                const auto hi = recording[hiIdx].pos.find(id);
+                if (lo != recording[loIdx].pos.end())
+                    followHold = (hi != recording[hiIdx].pos.end())
+                                     ? Vector3Lerp(lo->second, hi->second, interpAlpha)
+                                     : lo->second;
+                anchor = followHold; // holds the last fix once the track is gone
+            }
+            cam.yaw = k.yaw;
+            cam.pitch = k.pitch;
+            cam.distance = k.dist;
+            cam.fovy = cs.fov;
+            cam.target = Vector3Add(anchor, k.target);
+            followId = -1;
+        }
 
         // Resolve the followed entity; if it has left the scene, drop back to free
         // camera. While following, smoothly chase it (orbit then rotates about it).
         const TelemetryRecord* followed = nullptr;
         if (followId >= 0) {
-            for (const auto& r : snap.records)
+            for (const auto& r : viewRecords)
                 if (static_cast<long long>(r.entityId) == followId &&
                     !(r.flags & FLAG_DESTROYED)) { followed = &r; break; }
             if (!followed) followId = -1;
@@ -1084,20 +1501,20 @@ int main(int argc, char** argv) {
                 if (Vector3Distance(cam.target, mp) < 0.05f) followLocked = true;
             }
         }
-        updateCamera(cam, tracking, uiActive);
-
-        // Age detonations.
-        const float dt = GetFrameTime();
-        for (auto& d : detonations) d.age += dt;
-        detonations.erase(
-            std::remove_if(detonations.begin(), detonations.end(),
-                           [](const Detonation& d) { return d.age > 1.2f; }),
-            detonations.end());
+        if (!clipRendering) updateCamera(cam, tracking, uiActive);
 
         // --- Render -----------------------------------------------------------
         BeginDrawing();
         ClearBackground(Color{8, 10, 16, 255});
 
+        // Scale the near plane with the orbit distance. A 24-bit depth buffer's
+        // resolution at range z is about z^2 / (near * 2^24), so raylib's fixed
+        // 10 m near plane leaves ~15 m steps at 50 km and ~30 m at 70 km: wider
+        // than the 14 m between the river and the ground deck, which z-fought
+        // into flickering bands in overhead shots. 1% of the distance keeps those
+        // steps under a metre at any range and still never clips what is framed
+        // (the nearest subject sits at the orbit target, a full distance away).
+        rlSetClipPlanes(Clamp(cam.distance * 0.01f, 0.01f, 2.0f), 1000.0);
         BeginMode3D(cam.toCamera());
         {
             // Solid terrain deck just below Z = 0 hides anything that grazes the
@@ -1105,8 +1522,19 @@ int main(int argc, char** argv) {
             DrawPlane(Vector3{0.0f, -0.02f, 0.0f}, Vector2{100.0f, 100.0f},
                       Color{16, 22, 30, 255});
             // Airspace grid (100 x 100 km) and altitude ceiling wireframe,
-            // both centered on the origin to match the recentered world.
-            DrawGrid(100, 1.0f);
+            // both centered on the origin to match the recentered world. Drawn by
+            // hand (rather than DrawGrid, whose palette is fixed) so the lines are a
+            // soft half-transparent grey that reads without fighting the tracks.
+            {
+                constexpr int   kSlices = 100;         // 1 km spacing
+                constexpr float kHalf   = kSlices / 2.0f;
+                const Color gcol{160, 160, 160, 90};
+                for (int i = -kSlices / 2; i <= kSlices / 2; ++i) {
+                    const float f = static_cast<float>(i);
+                    DrawLine3D(Vector3{f, 0.0f, -kHalf}, Vector3{f, 0.0f, kHalf}, gcol);
+                    DrawLine3D(Vector3{-kHalf, 0.0f, f}, Vector3{kHalf, 0.0f, f}, gcol);
+                }
+            }
             DrawCubeWires(Vector3{0.0f, 10.0f, 0.0f}, 100.0f, 20.0f, 100.0f,
                           Color{40, 60, 90, 255});
 
@@ -1310,7 +1738,7 @@ int main(int argc, char** argv) {
             // Entities. Missiles keep real proportions but are drawn enlarged so
             // they read against the magnified skyline (same spirit as kCityScale);
             // a short heading dart is kept as a sensor annotation.
-            for (const auto& r : snap.records) {
+            for (const auto& r : viewRecords) {
                 if (r.flags & FLAG_DESTROYED) continue;
                 const Vector3 p = livePos(r);
                 const Vector3 v = recVel(r);
@@ -1343,7 +1771,7 @@ int main(int argc, char** argv) {
                     if (engaged) {
                         const Color los = neutral ? Color{40, 150, 60, 140}
                                                   : Color{0, 255, 120, 140};
-                        for (const auto& t : snap.records) {
+                        for (const auto& t : viewRecords) {
                             if (t.entityId == r.targetId &&
                                 !(t.flags & FLAG_DESTROYED)) {
                                 DrawLine3D(p, livePos(t), los);
@@ -1369,150 +1797,296 @@ int main(int argc, char** argv) {
         }
         EndMode3D();
 
-        // --- C2 HUD (2D overlay) ---------------------------------------------
-        int activeHostiles = 0;
-        for (const auto& r : snap.records)
-            if (isHostile(r) && !(r.flags & FLAG_DESTROYED)) ++activeHostiles;
-        const int neutralized = neutralizedPeak;
-        const int totalEngaged = neutralized + activeHostiles;
-        const float successRate =
-            totalEngaged > 0 ? 100.0f * neutralized / totalEngaged : 0.0f;
+        // Clip capture happens here, after the 3D scene and before any overlay, so
+        // a recording is always the clean feed whatever is shown on screen.
+        if (writer.active()) writer.grab();
 
-        // Size the HUD panel to the widest line (the instances readout) so nothing
-        // spills past the dark background.
-        char instLine[128];
-        std::snprintf(instLine, sizeof(instLine),
-                      "instances : %d / %d drawn   [B]buf:%s [F]cull:%s [L]lod:%s",
-                      cityDrawn + cityLod, cityTotal, staticInst ? "on" : "off",
-                      frustumCull ? "on" : "off", lod ? "on" : "off");
-        const float hudTextW = MeasureTextEx(uiFont, instLine, 18.0f, 1.0f).x;
-        const int hudW = std::max(360, static_cast<int>(hudTextW) + 32);
-        DrawRectangle(0, 0, hudW, 240, Color{0, 0, 0, 160});
-        DT("C2 TACTICAL DISPLAY", 16, 12, 20, RAYWHITE);
-        char line[128];
-        std::snprintf(line, sizeof(line), "source        : %s", consumer->SourceName());
-        DT(line, 16, 40, 18, LIGHTGRAY);
-        std::snprintf(line, sizeof(line), "active hostiles : %d", activeHostiles);
-        DT(line, 16, 62, 18, activeHostiles > 0 ? ORANGE : GREEN);
-        std::snprintf(line, sizeof(line), "neutralized     : %d", neutralized);
-        DT(line, 16, 84, 18, GREEN);
-        std::snprintf(line, sizeof(line), "asset losses    : %d", assetLosses);
-        DT(line, 16, 106, 18, assetLosses > 0 ? RED : GRAY);
-        std::snprintf(line, sizeof(line), "success rate    : %.0f%%", successRate);
-        DT(line, 16, 128, 18, RAYWHITE);
-        std::snprintf(line, sizeof(line), "telemetry       : %.1f Hz  (%.0f KB/s)",
-                      telemetryFps, throughputKBs);
-        DT(line, 16, 150, 18, SKYBLUE);
-        std::snprintf(line, sizeof(line), "frame           : %llu",
-                      static_cast<unsigned long long>(snap.header.frameId));
-        DT(line, 16, 172, 18, GRAY);
-        DT(instLine, 16, 194, 18, Color{150, 200, 170, 255});
+        if (showUi) {
+            // --- C2 HUD (2D overlay) ---------------------------------------------
+            // All counters read the frame currently on screen, so the HUD is true to
+            // wherever the scrubber sits rather than always to the live tail.
+            int activeHostiles = 0;
+            for (const auto& r : viewRecords)
+                if (isHostile(r) && !(r.flags & FLAG_DESTROYED)) ++activeHostiles;
+            const int neutralized = (loIdx >= 0) ? recording[loIdx].interceptCount : 0;
+            const int assetLosses = (loIdx >= 0) ? recording[loIdx].assetLosses : 0;
+            const int totalEngaged = neutralized + activeHostiles;
+            const float successRate =
+                totalEngaged > 0 ? 100.0f * neutralized / totalEngaged : 0.0f;
 
-        DT("[Click] follow  [Tab] cycle  [Esc/C] free-cam  [drag] orbit  [wheel] zoom  [B]uf [F]cull [L]od",
-                 16, screenH - 26, 16, Color{160, 170, 180, 255});
-        {
-            char fps[24];
-            std::snprintf(fps, sizeof(fps), "%d FPS", GetFPS());
-            const int f = GetFPS();
-            DT(fps, 16, screenH - 48, 18, f >= 55 ? GREEN : (f >= 30 ? YELLOW : RED));
-        }
+            // Size the HUD panel to the widest line (the instances readout) so nothing
+            // spills past the dark background.
+            char instLine[128];
+            std::snprintf(instLine, sizeof(instLine),
+                          "instances : %d / %d drawn   [B]buf:%s [F]cull:%s [L]lod:%s",
+                          cityDrawn + cityLod, cityTotal, staticInst ? "on" : "off",
+                          frustumCull ? "on" : "off", lod ? "on" : "off");
+            const float hudTextW = MeasureTextEx(uiFont, instLine, 18.0f, 1.0f).x;
+            const int hudW = std::max(360, static_cast<int>(hudTextW) + 32);
+            DrawRectangle(0, 0, hudW, 240, Color{0, 0, 0, 160});
+            DT("C2 TACTICAL DISPLAY", 16, 12, 20, RAYWHITE);
+            char line[128];
+            std::snprintf(line, sizeof(line), "source        : %s",
+                          consumer ? consumer->SourceName() : "replay");
+            DT(line, 16, 40, 18, LIGHTGRAY);
+            std::snprintf(line, sizeof(line), "active hostiles : %d", activeHostiles);
+            DT(line, 16, 62, 18, activeHostiles > 0 ? ORANGE : GREEN);
+            std::snprintf(line, sizeof(line), "neutralized     : %d", neutralized);
+            DT(line, 16, 84, 18, GREEN);
+            std::snprintf(line, sizeof(line), "asset losses    : %d", assetLosses);
+            DT(line, 16, 106, 18, assetLosses > 0 ? RED : GRAY);
+            std::snprintf(line, sizeof(line), "success rate    : %.0f%%", successRate);
+            DT(line, 16, 128, 18, RAYWHITE);
+            std::snprintf(line, sizeof(line), "telemetry       : %.1f Hz  (%.0f KB/s)",
+                          telemetryFps, throughputKBs);
+            DT(line, 16, 150, 18, SKYBLUE);
+            std::snprintf(line, sizeof(line), "frame           : %llu",
+                          static_cast<unsigned long long>(havePlay ? std::llround(playF) : 0));
+            DT(line, 16, 172, 18, GRAY);
+            DT(instLine, 16, 194, 18, Color{150, 200, 170, 255});
 
-        if (tracking) {
-            std::snprintf(line, sizeof(line), "FOLLOWING #%lld", followId);
-            DT(line, screenW - 240, 112, 20, GREEN);
-        }
-
-        // --- Render-FPS control: slider + integer text box (0..1000, 0=uncapped).
-        // Both widgets are views of targetFps; setFps() is the only writer, so a
-        // drag and a typed value can never disagree.
-        {
-            const Rectangle track{ panelRect.x + 14, panelRect.y + 54, 150, 6 };
-            const Rectangle box{ track.x + track.width + 16, track.y - 10, 58, 26 };
-            const float frac = targetFps / 1000.0f;
-            const float knobX = track.x + frac * track.width;
-            const Rectangle knob{ knobX - 6.0f, track.y - 7.0f, 12.0f, 20.0f };
-
-            // Slider: grab on the knob or anywhere along the track, then follow the
-            // pointer (even if it slides off the track) until the button releases.
-            const Rectangle grab{ track.x - 6.0f, track.y - 8.0f,
-                                  track.width + 12.0f, 22.0f };
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
-                (CheckCollisionPointRec(mousePos, knob) ||
-                 CheckCollisionPointRec(mousePos, grab))) {
-                fpsSliderDrag = true;
-                fpsBoxEditing = false;
-            }
-            if (fpsSliderDrag) {
-                if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-                    const float f = Clamp((mousePos.x - track.x) / track.width,
-                                          0.0f, 1.0f);
-                    setFps(static_cast<int>(std::lround(f * 1000.0f)));
-                } else {
-                    fpsSliderDrag = false;
-                }
+            const int hintY = screenH - static_cast<int>(scrubH) - 24;
+            DT("[Click] follow  [Tab] cycle  [Esc/C] free-cam  [drag] orbit  [wheel] zoom  [Space] pause  [H] hide UI  [R] record",
+                     16, hintY, 16, Color{160, 170, 180, 255});
+            {
+                char fps[24];
+                std::snprintf(fps, sizeof(fps), "%d FPS", GetFPS());
+                const int f = GetFPS();
+                DT(fps, 16, hintY - 22, 18, f >= 55 ? GREEN : (f >= 30 ? YELLOW : RED));
             }
 
-            // Text box: click to focus, type digits, Enter/click-away commits.
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-                const bool hitBox = CheckCollisionPointRec(mousePos, box);
-                if (fpsBoxEditing && !hitBox) commitFpsBox(); // click-away commits
-                fpsBoxEditing = hitBox;
-                if (hitBox) fpsBoxText.clear(); // start fresh on focus
+            if (tracking) {
+                std::snprintf(line, sizeof(line), "FOLLOWING #%lld", followId);
+                DT(line, screenW - 240, 112, 20, GREEN);
             }
-            if (fpsBoxEditing) {
-                for (int key = GetCharPressed(); key > 0; key = GetCharPressed())
-                    if (key >= '0' && key <= '9' && fpsBoxText.size() < 4)
-                        fpsBoxText.push_back(static_cast<char>(key));
-                if (IsKeyPressed(KEY_BACKSPACE) && !fpsBoxText.empty())
-                    fpsBoxText.pop_back();
-                if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
-                    commitFpsBox();
+
+            // --- Render-FPS control: slider + integer text box (0..1000, 0=uncapped).
+            // Both widgets are views of targetFps; setFps() is the only writer, so a
+            // drag and a typed value can never disagree.
+            {
+                const Rectangle track{ panelRect.x + 14, panelRect.y + 54, 150, 6 };
+                const Rectangle box{ track.x + track.width + 16, track.y - 10, 58, 26 };
+                const float frac = targetFps / 1000.0f;
+                const float knobX = track.x + frac * track.width;
+                const Rectangle knob{ knobX - 6.0f, track.y - 7.0f, 12.0f, 20.0f };
+
+                // Slider: grab on the knob or anywhere along the track, then follow the
+                // pointer (even if it slides off the track) until the button releases.
+                const Rectangle grab{ track.x - 6.0f, track.y - 8.0f,
+                                      track.width + 12.0f, 22.0f };
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+                    (CheckCollisionPointRec(mousePos, knob) ||
+                     CheckCollisionPointRec(mousePos, grab))) {
+                    fpsSliderDrag = true;
                     fpsBoxEditing = false;
                 }
+                if (fpsSliderDrag) {
+                    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                        const float f = Clamp((mousePos.x - track.x) / track.width,
+                                              0.0f, 1.0f);
+                        setFps(static_cast<int>(std::lround(f * 1000.0f)));
+                    } else {
+                        fpsSliderDrag = false;
+                    }
+                }
+
+                // Text box: click to focus, type digits, Enter/click-away commits.
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                    const bool hitBox = CheckCollisionPointRec(mousePos, box);
+                    if (fpsBoxEditing && !hitBox) commitFpsBox(); // click-away commits
+                    fpsBoxEditing = hitBox;
+                    if (hitBox) fpsBoxText.clear(); // start fresh on focus
+                }
+                if (fpsBoxEditing) {
+                    for (int key = GetCharPressed(); key > 0; key = GetCharPressed())
+                        if (key >= '0' && key <= '9' && fpsBoxText.size() < 4)
+                            fpsBoxText.push_back(static_cast<char>(key));
+                    if (IsKeyPressed(KEY_BACKSPACE) && !fpsBoxText.empty())
+                        fpsBoxText.pop_back();
+                    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+                        commitFpsBox();
+                        fpsBoxEditing = false;
+                    }
+                }
+
+                // Draw the panel.
+                DrawRectangleRec(panelRect, Color{0, 0, 0, 160});
+                DrawRectangleLinesEx(panelRect, 1.0f, Color{40, 60, 90, 255});
+                DT("DISPLAY", static_cast<int>(panelRect.x) + 14,
+                   static_cast<int>(panelRect.y) + 8, 18, RAYWHITE);
+                DT(targetFps == 0 ? "render cap : uncapped" : "render cap",
+                   static_cast<int>(panelRect.x) + 14,
+                   static_cast<int>(panelRect.y) + 30, 14, LIGHTGRAY);
+                DrawRectangleRec(track, Color{60, 70, 90, 255});
+                DrawRectangle(static_cast<int>(track.x), static_cast<int>(track.y),
+                              static_cast<int>(frac * track.width),
+                              static_cast<int>(track.height), Color{0, 150, 190, 255});
+                DrawRectangleRec(knob, fpsSliderDrag ? SKYBLUE : RAYWHITE);
+                DrawRectangleRec(box, Color{20, 26, 36, 255});
+                DrawRectangleLinesEx(box, 1.0f,
+                                     fpsBoxEditing ? SKYBLUE : Color{70, 80, 100, 255});
+                const std::string shown = fpsBoxEditing ? fpsBoxText + "_" : fpsBoxText;
+                DT(shown.c_str(), static_cast<int>(box.x) + 6,
+                   static_cast<int>(box.y) + 5, 16, RAYWHITE);
             }
 
-            // Draw the panel.
-            DrawRectangleRec(panelRect, Color{0, 0, 0, 160});
-            DrawRectangleLinesEx(panelRect, 1.0f, Color{40, 60, 90, 255});
-            DT("DISPLAY", static_cast<int>(panelRect.x) + 14,
-               static_cast<int>(panelRect.y) + 8, 18, RAYWHITE);
-            DT(targetFps == 0 ? "render cap : uncapped" : "render cap",
-               static_cast<int>(panelRect.x) + 14,
-               static_cast<int>(panelRect.y) + 30, 14, LIGHTGRAY);
-            DrawRectangleRec(track, Color{60, 70, 90, 255});
-            DrawRectangle(static_cast<int>(track.x), static_cast<int>(track.y),
-                          static_cast<int>(frac * track.width),
-                          static_cast<int>(track.height), Color{0, 150, 190, 255});
-            DrawRectangleRec(knob, fpsSliderDrag ? SKYBLUE : RAYWHITE);
-            DrawRectangleRec(box, Color{20, 26, 36, 255});
-            DrawRectangleLinesEx(box, 1.0f,
-                                 fpsBoxEditing ? SKYBLUE : Color{70, 80, 100, 255});
-            const std::string shown = fpsBoxEditing ? fpsBoxText + "_" : fpsBoxText;
-            DT(shown.c_str(), static_cast<int>(box.x) + 6,
-               static_cast<int>(box.y) + 5, 16, RAYWHITE);
+            // --- Transport scrubber: play/pause, a draggable timeline over the whole
+            // captured run, and a jump-to-live button. Lets a shot be frozen and any
+            // moment reframed for recording, with the producer never contacted.
+            if (havePlay && !recording.empty()) {
+                const double oldest = recording.front().frame;
+                const double newest = recording.back().frame;
+                const double spanF  = std::max(1.0, newest - oldest);
+                const double elapsedS = (playF - oldest) / 60.0; // 60 Hz production
+                const double totalS   = spanF / 60.0;
+                auto fmt = [](double sec, char* out, std::size_t n) {
+                    if (sec < 0.0) sec = 0.0;
+                    const int t = static_cast<int>(sec);
+                    std::snprintf(out, n, "%d:%02d", t / 60, t % 60);
+                };
+
+                // Play/pause toggle and jump-to-live.
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                    if (CheckCollisionPointRec(mousePos, playBtn)) {
+                        paused = !paused;
+                        if (paused) live = false; // DVR-style, as [Space]
+                    }
+                    else if (CheckCollisionPointRec(mousePos, liveBtn)) {
+                        paused = false; live = true;
+                    }
+                }
+                // Grab anywhere along the track (a little vertical slop), then follow the
+                // pointer until release. Scrubbing pauses and drops out of live-follow.
+                const Rectangle grab{ scrubTrack.x - 4.0f, scrubTrack.y - 9.0f,
+                                      scrubTrack.width + 8.0f, 24.0f };
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+                    CheckCollisionPointRec(mousePos, grab)) {
+                    scrubDrag = true;
+                    paused = true;
+                    live = false;
+                }
+                if (scrubDrag) {
+                    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                        const double frac = Clamp(
+                            (mousePos.x - scrubTrack.x) / scrubTrack.width, 0.0f, 1.0f);
+                        playF = oldest + frac * spanF;
+                    } else {
+                        scrubDrag = false;
+                    }
+                }
+
+                // Draw the bar.
+                DrawRectangleRec(scrubBar, Color{0, 0, 0, 170});
+                DrawRectangleLinesEx(scrubBar, 1.0f, Color{40, 60, 90, 255});
+                // Play / pause glyph.
+                DrawRectangleRec(playBtn, Color{20, 26, 36, 255});
+                DrawRectangleLinesEx(playBtn, 1.0f, Color{70, 80, 100, 255});
+                if (paused) { // triangle = will play
+                    const float cx = playBtn.x + 11.0f, cy = playBtn.y + 8.0f;
+                    DrawTriangle(Vector2{cx, cy}, Vector2{cx, cy + 14.0f},
+                                 Vector2{cx + 12.0f, cy + 7.0f}, RAYWHITE);
+                } else {      // two bars = will pause
+                    DrawRectangle(static_cast<int>(playBtn.x) + 9,
+                                  static_cast<int>(playBtn.y) + 8, 4, 14, RAYWHITE);
+                    DrawRectangle(static_cast<int>(playBtn.x) + 17,
+                                  static_cast<int>(playBtn.y) + 8, 4, 14, RAYWHITE);
+                }
+                // Track, played portion, and playhead.
+                const float frac = static_cast<float>((playF - oldest) / spanF);
+                DrawRectangleRec(scrubTrack, Color{60, 70, 90, 255});
+                DrawRectangle(static_cast<int>(scrubTrack.x),
+                              static_cast<int>(scrubTrack.y),
+                              static_cast<int>(frac * scrubTrack.width),
+                              static_cast<int>(scrubTrack.height),
+                              Color{0, 150, 190, 255});
+                const float headX = scrubTrack.x + frac * scrubTrack.width;
+                DrawRectangleRec(Rectangle{headX - 3.0f, scrubTrack.y - 7.0f, 6.0f, 20.0f},
+                                 scrubDrag ? SKYBLUE : RAYWHITE);
+                // Time labels.
+                char cur[16], tot[16];
+                fmt(elapsedS, cur, sizeof(cur));
+                fmt(totalS, tot, sizeof(tot));
+                DT(cur, static_cast<int>(playBtn.x) + 40,
+                   static_cast<int>(scrubTrack.y) - 6, 16, LIGHTGRAY);
+                DT(tot, static_cast<int>(scrubTrack.x + scrubTrack.width) + 8,
+                   static_cast<int>(scrubTrack.y) - 6, 16, LIGHTGRAY);
+                // Live button: lit when playback is riding the tail.
+                const bool atLive = live && !paused;
+                DrawRectangleRec(liveBtn, atLive ? Color{20, 70, 40, 255}
+                                                 : Color{20, 26, 36, 255});
+                DrawRectangleLinesEx(liveBtn, 1.0f,
+                                     atLive ? GREEN : Color{70, 80, 100, 255});
+                DT("LIVE", static_cast<int>(liveBtn.x) + 12,
+                   static_cast<int>(liveBtn.y) + 7, 16, atLive ? GREEN : LIGHTGRAY);
+            }
+
+            // --- Hover ring: encircle the missile under the cursor and label its
+            // allegiance (ENEMY / ALLY / DOMESTIC). One missile at a time, and only
+            // while not orbiting (a drag would make the pointer position meaningless).
+            if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
+                !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && !overPanel && !overScrub) {
+                const int hov = pickNearestMissile(GetMousePosition(), 45.0f);
+                if (hov >= 0) {
+                    const TelemetryRecord& r = viewRecords[hov];
+                    const Vector2 s = GetWorldToScreen(livePos(r), cam.toCamera());
+                    const Color col = trackColor(r);
+                    DrawRing(s, 18.0f, 21.0f, 0.0f, 360.0f, 48, col);
+                    DrawRing(s, 21.0f, 22.5f, 0.0f, 360.0f, 48, ColorAlpha(BLACK, 0.5f));
+                    const char* lbl = trackLabel(r);
+                    const float lw = MeasureTextEx(uiFont, lbl, 18.0f, 1.0f).x;
+                    DrawRectangle(static_cast<int>(s.x) + 26, static_cast<int>(s.y) - 11,
+                                  static_cast<int>(lw) + 8, 22, ColorAlpha(BLACK, 0.55f));
+                    DT(lbl, static_cast<int>(s.x) + 30, static_cast<int>(s.y) - 9, 18, col);
+                }
+            }
+        } // showUi
+
+        // On-screen only (drawn after the grab): a recording light, and progress
+        // while scripted clips render.
+        if (writer.active() && !scripted) {
+            DrawCircle(screenW - 28, screenH - 72, 8.0f, RED);
+            char rec[48];
+            std::snprintf(rec, sizeof(rec), "REC %d:%02d", writer.frames / 3600,
+                          (writer.frames / 60) % 60);
+            DT(rec, screenW - 112, screenH - 82, 18, RED);
         }
-
-        // --- Hover ring: encircle the missile under the cursor and label its
-        // allegiance (ENEMY / ALLY / DOMESTIC). One missile at a time, and only
-        // while not orbiting (a drag would make the pointer position meaningless).
-        if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
-            !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && !overPanel) {
-            const int hov = pickNearestMissile(GetMousePosition(), 45.0f);
-            if (hov >= 0) {
-                const TelemetryRecord& r = snap.records[hov];
-                const Vector2 s = GetWorldToScreen(livePos(r), cam.toCamera());
-                const Color col = trackColor(r);
-                DrawRing(s, 18.0f, 21.0f, 0.0f, 360.0f, 48, col);
-                DrawRing(s, 21.0f, 22.5f, 0.0f, 360.0f, 48, ColorAlpha(BLACK, 0.5f));
-                const char* lbl = trackLabel(r);
-                const float lw = MeasureTextEx(uiFont, lbl, 18.0f, 1.0f).x;
-                DrawRectangle(static_cast<int>(s.x) + 26, static_cast<int>(s.y) - 11,
-                              static_cast<int>(lw) + 8, 22, ColorAlpha(BLACK, 0.55f));
-                DT(lbl, static_cast<int>(s.x) + 30, static_cast<int>(s.y) - 9, 18, col);
-            }
+        if (scripted) {
+            char msg[256];
+            if (clipRendering)
+                std::snprintf(msg, sizeof(msg), "rendering %s  (%zu/%zu)  %d/%d",
+                              clipSpecs[clipIdx].name.c_str(), clipIdx + 1,
+                              clipSpecs.size(), clipFrame,
+                              static_cast<int>(clipSpecs[clipIdx].length * 60.0));
+            else
+                std::snprintf(msg, sizeof(msg), "capturing run: %zu frames",
+                              recording.size());
+            DT(msg, 12, 10, 18, Color{150, 160, 170, 255});
         }
 
         EndDrawing();
+
+        // Save the captured run once the producer has finished (and again on exit
+        // for a run the window was closed on), so it can be replayed and clipped.
+        if (runDone && !runSaved && !replaying && !opt.saveRec.empty()) {
+            runSaved = true;
+            if (saveRun(opt.saveRec, rawRun))
+                TraceLog(LOG_WARNING, "run saved: %s (%zu frames)",
+                         opt.saveRec.c_str(), rawRun.size());
+        }
+
+        // Advance the scripted clip; close it at its length and move to the next.
+        if (clipRendering) {
+            ++clipFrame;
+            if (clipFrame >= static_cast<int>(clipSpecs[clipIdx].length * 60.0)) {
+                writer.close();
+                std::fprintf(stdout, "clip written: %s (%d frames)\n",
+                             writer.path.c_str(), writer.frames);
+                std::fflush(stdout);
+                ++clipIdx;
+                clipFrame = -1;
+                if (clipIdx >= clipSpecs.size()) break;
+            }
+        }
 
         // --- Headless capture / bounded run ----------------------------------
         ++frameCounter;
@@ -1524,6 +2098,15 @@ int main(int argc, char** argv) {
             break;
         }
     }
+
+    if (writer.active()) {
+        writer.close();
+        TraceLog(LOG_WARNING, "clip saved: %s", writer.path.c_str());
+    }
+    if (!runSaved && !replaying && !opt.saveRec.empty() && !rawRun.empty() &&
+        saveRun(opt.saveRec, rawRun))
+        TraceLog(LOG_WARNING, "run saved: %s (%zu frames)", opt.saveRec.c_str(),
+                 rawRun.size());
 
     for (int k = 0; k < 5; ++k)
         for (int p = 0; p < 2; ++p) {

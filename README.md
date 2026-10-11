@@ -279,6 +279,31 @@ Command-and-Control HUD, injecting zero overhead into the engine process.
 c2_visualizer.exe --source udp --port 9090
 ```
 
+### Replay, scrubbing, and clip capture
+
+The visualizer keeps every telemetry frame it receives, so the whole run can be
+paused, scrubbed, and replayed locally without touching the producer. The bottom
+bar is a timeline: drag to scrub, **[Space]** pauses (DVR style), **LIVE** or
+**[End]** returns to the live edge. **[H]** hides every overlay for a clean feed,
+and **[R]** records the 3D scene to `clips/clip_NNN.mp4` through ffmpeg. Frames
+are grabbed before the HUD is drawn, so recordings never contain the GUI.
+
+```bash
+# Capture a run to disk while watching it live
+c2_visualizer --source shm --save-rec clips/run.drec
+
+# Scrub a saved run later, no simulation needed
+c2_visualizer --replay clips/run.drec
+
+# Render a scripted shot list (camera keys, follow cams, slow motion) offline
+c2_visualizer --replay clips/run.drec --clips clips/shots.txt --size 1920x1080
+```
+
+`clips/shots.txt` documents the shot format and holds the showcase clips. Scripted
+renders run uncapped with 4x MSAA and step exactly one 60 Hz telemetry frame per
+video frame (scaled by the clip's playback speed), so clips are smooth whatever
+the render rate. Needs `ffmpeg` on `PATH`.
+
 ---
 
 ## Building
