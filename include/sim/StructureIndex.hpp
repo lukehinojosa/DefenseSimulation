@@ -46,6 +46,7 @@ public:
                double cellSize = kDefaultCellSize) {
         structures_ = city;
         cells_.clear();
+        cellTop_.clear();
         nx_ = ny_ = 0;
         if (structures_.empty()) return;
 
@@ -65,13 +66,17 @@ public:
         ny_ = std::max(1, static_cast<int>(std::floor((maxY - minY_) / cell_)) + 1);
         cells_.assign(static_cast<std::size_t>(nx_) * ny_, {});
 
+        cellTop_.assign(cells_.size(), 0.0);
         for (std::size_t i = 0; i < structures_.size(); ++i) {
             const BoundingBox& b = structures_[i].box;
             const int x0 = clampX(cellX(b.min.x)), x1 = clampX(cellX(b.max.x));
             const int y0 = clampY(cellY(b.min.y)), y1 = clampY(cellY(b.max.y));
             for (int y = y0; y <= y1; ++y)
-                for (int x = x0; x <= x1; ++x)
+                for (int x = x0; x <= x1; ++x) {
                     cells_[index(x, y)].push_back(static_cast<std::uint32_t>(i));
+                    double& top = cellTop_[index(x, y)];
+                    top = std::max(top, b.max.z);
+                }
         }
     }
 
@@ -101,7 +106,9 @@ public:
      * greatest box.max.z among their structures. The pad acts as a lookahead so a
      * caller (e.g. interceptor terrain-following) sees a tall building's height
      * before it arrives over it. Returns 0 when the query lies entirely off the
-     * city footprint, so open ground/water reports "no skyline". O(cells in pad).
+     * city footprint, so open ground/water reports "no skyline". O(cells in pad):
+     * each cell's tallest roof is cached at build time, so the cost does not
+     * depend on how many buildings a dense downtown cell holds.
      */
     double skylineHeight(double x, double y, double pad = 0.0) const {
         if (cells_.empty()) return 0.0;
@@ -114,8 +121,7 @@ public:
         double h = 0.0;
         for (int gy = y0; gy <= y1; ++gy)
             for (int gx = x0; gx <= x1; ++gx)
-                for (std::uint32_t i : cells_[index(gx, gy)])
-                    h = std::max(h, structures_[i].box.max.z);
+                h = std::max(h, cellTop_[index(gx, gy)]);
         return h;
     }
 
@@ -142,6 +148,7 @@ private:
 
     std::vector<CityStructure>              structures_;
     std::vector<std::vector<std::uint32_t>> cells_;
+    std::vector<double>                     cellTop_; ///< tallest box.max.z per cell
     double cell_{kDefaultCellSize};
     double minX_{0.0}, minY_{0.0};
     double maxX_{0.0}, maxY_{0.0};

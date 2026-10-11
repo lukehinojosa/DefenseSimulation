@@ -37,6 +37,11 @@ public:
                 threadCount = 1;
             }
         }
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+        // Single-threaded WebAssembly build (no SharedArrayBuffer, so it runs on
+        // any static host): no workers exist and parallelFor() runs inline.
+        threadCount = 0;
+#endif
         workers_.reserve(threadCount);
         for (std::size_t i = 0; i < threadCount; ++i) {
             workers_.emplace_back([this] { workerLoop(); });

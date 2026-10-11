@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Defense Simulation</title>
+<meta name="description" content="Missile-defense engagement over a 1:1 New York City, simulated in C++ and running in the browser via WebAssembly.">
+<style>
+  :root {
+    --bg: #080a10;
+    --panel: rgba(12, 16, 24, 0.82);
+    --line: rgba(120, 160, 200, 0.22);
+    --text: #d6e2ee;
+    --dim: #8496a8;
+    --accent: #4fd1a5;
+    --warn: #ffb347;
+    --bad: #ff6b5a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none;
+  }
+  canvas#canvas {
+    position: fixed; inset: 0; width: 100%; height: 100%; display: block;
+    touch-action: none; outline: none; cursor: grab;
+  }
+  canvas#canvas:active { cursor: grabbing; }
+
+  .panel {
+    position: fixed; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  }
+
+  /* HUD */
+  #hud {
+    top: max(12px, env(safe-area-inset-top)); left: max(12px, env(safe-area-inset-left));
+    padding: 10px 12px; min-width: 210px; font-family: var(--mono); font-size: 12px;
+  }
+  #hud h1 { margin: 0 0 6px; font: 600 12px/1 var(--mono); letter-spacing: 0.12em; color: var(--accent); }
+  #hud .row { display: flex; justify-content: space-between; gap: 16px; }
+  #hud .row span:first-child { color: var(--dim); }
+  #hud .perf { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); color: var(--dim); }
+  #hud .clock { font-size: 18px; color: var(--text); margin-bottom: 4px; }
+  #hud button.collapse {
+    position: absolute; top: 6px; right: 6px; border: 0; background: none; color: var(--dim);
+    font: 14px var(--mono); cursor: pointer; padding: 2px 6px;
+  }
+  #hud.collapsed .body { display: none; }
+  #hud.collapsed { min-width: 0; }
+
+  /* Bottom dock: gesture hint stacked above the control bar */
+  #dock {
+    position: fixed; left: 0; right: 0; bottom: max(12px, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    pointer-events: none; padding: 0 12px;
+  }
+  #dock > * { pointer-events: auto; }
+  #controls {
+    position: static; display: flex; gap: 6px; padding: 6px; flex-wrap: wrap;
+    justify-content: center; max-width: 100%;
+  }
+  button.ctl {
+    border: 1px solid var(--line); background: rgba(30, 40, 56, 0.9); color: var(--text);
+    border-radius: 8px; padding: 9px 14px; font: 600 13px system-ui, sans-serif;
+    cursor: pointer; min-height: 40px; touch-action: manipulation;
+  }
+  button.ctl:hover { background: rgba(44, 58, 80, 0.95); }
+  button.ctl:disabled { opacity: 0.4; cursor: default; }
+  button.ctl.primary { background: #1f7a5c; border-color: #2fa37c; }
+  button.ctl.primary:hover { background: #26906c; }
+  .speed { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .speed button {
+    border: 0; background: rgba(30, 40, 56, 0.9); color: var(--dim); padding: 0 11px;
+    font: 600 12px var(--mono); cursor: pointer; min-height: 40px;
+  }
+  .speed button.on { background: #2b4a6b; color: var(--text); }
+  #freeCam { display: none; }
+  #freeCam.show { display: inline-block; }
+  #speedCycle, .ico { display: none; }
+
+  /* Hint */
+  #hint {
+    position: static; padding: 8px 12px; font-size: 12px; color: var(--dim);
+    text-align: center; transition: opacity 0.6s;
+  }
+  #hint.gone { opacity: 0; pointer-events: none; }
+
+  /* Overlay cards (loading / start / done) */
+  #overlay {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    pointer-events: none; padding: 16px;
+  }
+  #card {
+    pointer-events: auto; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 22px 24px; width: min(420px, 100%); text-align: center;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  }
+  #card h2 { margin: 0 0 6px; font-size: 18px; }
+  #card p { margin: 0 0 16px; color: var(--dim); font-size: 13px; }
+  #card .stats { font-family: var(--mono); font-size: 13px; margin: 0 0 16px; color: var(--text); }
+  .bar { height: 6px; border-radius: 3px; background: rgba(120, 160, 200, 0.15); overflow: hidden; }
+  .bar > div { height: 100%; width: 0%; background: var(--accent); transition: width 0.2s; }
+  #overlay.hidden { display: none; }
+
+  /* Rise / sink: hold to move the camera's look-at point up or down */
+  #lift {
+    top: 50%; right: max(12px, env(safe-area-inset-right)); transform: translateY(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px;
+  }
+  #lift button.ctl { width: 48px; min-height: 48px; padding: 0; font-size: 16px; touch-action: none; }
+  #lift .alt { font: 11px/1.2 var(--mono); color: var(--dim); text-align: center; }
+
+  .good { color: var(--accent); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+
+  /* Phones: a tighter HUD (every stat, smaller type) and a single-row icon dock */
+  @media (max-width: 560px) {
+    #hud { min-width: 0; font-size: 11px; line-height: 1.3; padding: 8px 10px; }
+    #hud .row { gap: 10px; }
+    #hud .clock { font-size: 15px; padding-right: 18px; }
+    #hud .perf { margin-top: 4px; padding-top: 4px; }
+    #controls { flex-wrap: nowrap; }
+    button.ctl { padding: 8px 11px; font-size: 13px; min-width: 44px; min-height: 44px; }
+    .speed { display: none; }
+    #speedCycle, .ico { display: inline; }
+    #speedCycle { display: inline-block; font-family: var(--mono); }
+    .lbl { display: none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+
+<div id="hud" class="panel">
+  <button class="collapse" id="hudToggle" aria-label="Collapse panel">&minus;</button>
+  <h1>C2 // AIR DEFENSE</h1>
+  <div class="body">
+    <div class="clock" id="hClock">T+ 00:00</div>
+    <div class="row"><span>Threats airborne</span><span id="hThreats">-</span></div>
+    <div class="row"><span>Intercepts</span><span id="hIntercepts" class="good">0</span></div>
+    <div class="row"><span>City impacts</span><span id="hLosses">0</span></div>
+    <div class="row extra"><span>Interceptors aloft</span><span id="hInterceptors">-</span></div>
+    <div class="row extra"><span>Rounds launched</span><span id="hLaunched">-</span></div>
+    <div class="perf">
+      <div class="row"><span>FPS</span><span id="hFps">-</span></div>
+      <div class="row"><span>Resolution</span><span id="hRes">-</span></div>
+      <div class="row"><span>Buildings drawn</span><span id="hDrawn">-</span></div>
+      <div class="row"><span>Far-field blocks</span><span id="hBlocks">-</span></div>
+      <div class="row"><span>Sim step</span><span id="hSim">-</span></div>
+    </div>
+  </div>
+</div>
+
+<div id="lift" class="panel">
+  <button class="ctl" id="liftUp" aria-label="Raise camera" title="Raise camera (E / Page Up)">&#x25B2;</button>
+  <div class="alt" id="hAlt">ALT<br>1.5 km</div>
+  <button class="ctl" id="liftDown" aria-label="Lower camera" title="Lower camera (Q / Page Down)">&#x25BC;</button>
+</div>
+
+<div id="dock">
+  <div id="hint" class="panel"></div>
+  <div id="controls" class="panel">
+    <button class="ctl primary" id="startBtn" disabled>Start</button>
+    <button class="ctl" id="pauseBtn" disabled>Pause</button>
+    <div class="speed" id="speed">
+      <button data-s="0.5">0.5&times;</button><button data-s="1" class="on">1&times;</button><button data-s="2">2&times;</button><button data-s="4">4&times;</button>
+    </div>
+    <button class="ctl" id="speedCycle" aria-label="Playback speed">1&times;</button>
+    <button class="ctl" id="freeCam" aria-label="Free camera"><span class="lbl">Free camera</span><span class="ico">&#x2715;</span></button>
+    <button class="ctl" id="resetView" aria-label="Reset view"><span class="lbl">Reset view</span><span class="ico">&#x27F2;</span></button>
+    <button class="ctl" id="fsBtn" aria-label="Fullscreen">&#x26F6;</button>
+  </div>
+</div>
+
+<div id="overlay">
+  <div id="card">
+    <h2 id="cardTitle">Loading simulation</h2>
+    <p id="cardText">Downloading the simulation and the 1:1 New York City map&hellip;</p>
+    <div class="stats" id="cardStats" hidden></div>
+    <div class="bar" id="cardBar"><div id="cardBarFill"></div></div>
+    <button class="ctl primary" id="cardBtn" hidden>Start simulation</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var canvas = $('canvas');
+  var ready = false, state = 0, following = false;
+
+  // Render resolution (canvas pixels per CSS pixel) is adaptive: it starts at
+  // 2x (or the screen's own density if lower) and climbs in 0.25x steps toward
+  // the screen's native density (3x on most phones) while frames hold 60 fps.
+  // See the resolution governor below.
+  var coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  var STEP = 0.25, MIN_SCALE = 1;
+  function nativeScale() { return Math.min(window.devicePixelRatio || 1, 3); }
+  var scale = Math.min(nativeScale(), 2);
+  var scaleCeiling = nativeScale(); // lowered whenever a step proves too heavy
+  function renderScale() { return scale; }
+  window.desiredCanvasWidth = function () { return Math.max(1, Math.round(window.innerWidth * renderScale())); };
+  window.desiredCanvasHeight = function () { return Math.max(1, Math.round(window.innerHeight * renderScale())); };
+
+  if (!document.createElement('canvas').getContext('webgl2')) {
+    showCard('WebGL2 not available', 'This simulation needs a browser with WebGL2 (any current Chrome, Edge, Firefox, or Safari 15+).', null);
+    $('cardBar').hidden = true;
+    return;
+  }
+
+  function showCard(title, text, btnLabel, statsHtml) {
+    $('overlay').classList.remove('hidden');
+    $('cardTitle').textContent = title;
+    $('cardText').textContent = text;
+    $('cardBtn').hidden = !btnLabel;
+    if (btnLabel) $('cardBtn').textContent = btnLabel;
+    $('cardStats').hidden = !statsHtml;
+    if (statsHtml) $('cardStats').innerHTML = statsHtml;
+  }
+  function hideCard() { $('overlay').classList.add('hidden'); }
+
+  function fmt(t) {
+    t = Math.max(0, Math.floor(t));
+    return String(Math.floor(t / 60)).padStart(2, '0') + ':' + String(t % 60).padStart(2, '0');
+  }
+
+  // --- Called from C++ ------------------------------------------------------
+  window.simReady = function () {
+    ready = true;
+    $('cardBar').hidden = true;
+    $('startBtn').disabled = false;
+    showCard('Defend the city', 'A 100-missile raid inbound on Midtown Manhattan. Ground batteries and allied interceptors engage with proportional navigation. Every building is drawn 1:1.', 'Start simulation');
+  };
+  window.simFailed = function (msg) { showCard('Something went wrong', msg, null); $('cardBar').hidden = true; };
+
+  window.hudUpdate = function (s) {
+    state = s.state;
+    $('hClock').textContent = 'T+ ' + fmt(s.t) + ' / ' + fmt(s.total);
+    $('hThreats').textContent = s.hostiles + ' / ' + s.threatsTotal;
+    $('hIntercepts').textContent = s.intercepts;
+    $('hLosses').textContent = s.losses;
+    $('hLosses').className = s.losses > 0 ? 'bad' : '';
+    $('hInterceptors').textContent = s.interceptors;
+    $('hLaunched').textContent = s.launched;
+    $('hFps').textContent = Math.round(s.fps);
+    $('hRes').textContent = canvas.width + '\u00d7' + canvas.height + ' (' + scale.toFixed(2) + '\u00d7)';
+    governResolution(s.fps, s.pxMin);
+    $('hDrawn').textContent = s.drawn.toLocaleString() + ' / ' + s.buildings.toLocaleString();
+    $('hBlocks').textContent = s.massing.toLocaleString();
+    $('hSim').textContent = s.simMs.toFixed(1) + ' ms';
+    $('hAlt').innerHTML = 'ALT<br>' + s.alt.toFixed(1) + ' km';
+    following = !!s.following;
+    $('freeCam').classList.toggle('show', following);
+
+    $('startBtn').textContent = state === 0 ? 'Start' : 'Restart';
+    $('pauseBtn').disabled = !(state === 1 || state === 2);
+    $('pauseBtn').textContent = state === 2 ? 'Resume' : 'Pause';
+    if (state === 3 && !doneShown) {
+      doneShown = true;
+      var held = s.losses === 0;
+      showCard(held ? 'City defended' : 'Engagement complete',
+        'The raid is over. Restart to run it again, or keep flying the camera around.',
+        'Restart',
+        '<span class="good">' + s.intercepts + '</span> intercepts &middot; ' +
+        '<span class="' + (held ? '' : 'bad') + '">' + s.losses + '</span> city impacts &middot; ' +
+        s.launched + ' rounds fired');
+    }
+  };
+  var doneShown = false;
+
+  // --- Controls ---------------------------------------------------------------
+  function start() {
+    if (!ready) return;
+    doneShown = false;
+    hideCard();
+    Module._web_start();
+  }
+  $('cardBtn').onclick = function () { if (state === 3) { hideCard(); } start(); };
+  $('startBtn').onclick = start;
+  $('pauseBtn').onclick = function () { if (ready) Module._web_set_paused(state === 1 ? 1 : 0); };
+  $('resetView').onclick = function () { if (ready) Module._web_reset_view(); };
+  $('freeCam').onclick = function () { if (ready) Module._web_free_camera(); };
+  $('hudToggle').onclick = function () {
+    var c = $('hud').classList.toggle('collapsed');
+    $('hudToggle').innerHTML = c ? '+' : '&minus;';
+  };
+  var speeds = [0.5, 1, 2, 4], speedIdx = 1;
+  function setSpeed(i) {
+    speedIdx = i;
+    Array.prototype.forEach.call($('speed').children, function (o, k) { o.classList.toggle('on', k === i); });
+    $('speedCycle').innerHTML = speeds[i] + '&times;';
+    if (ready) Module._web_set_speed(speeds[i]);
+  }
+  Array.prototype.forEach.call($('speed').children, function (b, k) { b.onclick = function () { setSpeed(k); }; });
+  // Hold-to-move rise/sink buttons (pointer capture keeps the release on the button).
+  [['liftUp', 1], ['liftDown', -1]].forEach(function (b) {
+    var el = $(b[0]);
+    el.addEventListener('pointerdown', function (e) {
+      if (!ready) return;
+      el.setPointerCapture(e.pointerId);
+      Module._web_set_lift(b[1]);
+      dismissHint();
+    });
+    ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(function (ev) {
+      el.addEventListener(ev, function () { if (ready) Module._web_set_lift(0); });
+    });
+    el.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  });
+  $('speedCycle').onclick = function () { setSpeed((speedIdx + 1) % speeds.length); };
+  $('hint').textContent = coarse
+    ? 'Drag to orbit · two fingers to pan and pinch to zoom · ▲▼ to rise and sink · tap a missile to follow it'
+    : 'Drag to orbit · right-drag to pan · scroll to zoom · E/Q or ▲▼ to rise and sink · click a missile to follow it';
+  var fsOk = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
+  if (!fsOk) $('fsBtn').hidden = true;
+  $('fsBtn').onclick = function () {
+    var d = document, el = d.documentElement;
+    if (d.fullscreenElement || d.webkitFullscreenElement) (d.exitFullscreen || d.webkitExitFullscreen).call(d);
+    else (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+  };
+  window.addEventListener('keydown', function (e) {
+    if (!ready || e.target.tagName === 'INPUT') return;
+    if (e.code === 'Space') { e.preventDefault(); if (state === 0) start(); else $('pauseBtn').click(); }
+    else if (e.code === 'KeyR') start();
+    else if (e.code === 'KeyF' || e.code === 'Escape') Module._web_free_camera();
+  });
+
+  // Fade the gesture hint after the first interaction.
+  var hintTimer = null;
+  function dismissHint() {
+    if (hintTimer) return;
+    hintTimer = setTimeout(function () { $('hint').classList.add('gone'); }, 2500);
+  }
+
+  // --- Camera gestures (Pointer Events: mouse, touch, and pen alike) ----------
+  var pts = new Map();
+  var tap = null;
+  function pinchState() {
+    var a = Array.from(pts.values());
+    return { d: Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y),
+             mx: (a[0].x + a[1].x) / 2, my: (a[0].y + a[1].y) / 2 };
+  }
+  var pinch = null;
+  canvas.addEventListener('pointerdown', function (e) {
+    if (!ready) return;
+    canvas.setPointerCapture(e.pointerId);
+    clearHover(); // a press starts an orbit or pan, where the pointer means nothing
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY, pan: e.button === 1 || e.button === 2 || e.shiftKey });
+    tap = pts.size === 1 ? { x: e.clientX, y: e.clientY, t: performance.now(), moved: false } : null;
+    pinch = pts.size === 2 ? pinchState() : null;
+    dismissHint();
+  });
+  // Mouse hover (touch has no hover): the module rings the missile under it.
+  function clearHover() { if (ready) Module._web_hover(-1, -1, 0); }
+  canvas.addEventListener('pointerleave', clearHover);
+  canvas.addEventListener('pointermove', function (e) {
+    if (ready && e.pointerType === 'mouse' && pts.size === 0) {
+      var r = canvas.getBoundingClientRect(), k = canvas.width / r.width;
+      Module._web_hover((e.clientX - r.left) * k, (e.clientY - r.top) * k, k);
+    }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    var p = pts.get(e.pointerId);
+    if (!p || !ready) return;
+    var dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (tap && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) > 8) tap.moved = true;
+    if (pts.size === 1) {
+      if (p.pan) Module._web_pan(dx / window.innerHeight, dy / window.innerHeight);
+      else Module._web_orbit(dx, dy);
+    } else if (pts.size === 2 && pinch) {
+      var n = pinchState();
+      if (n.d > 0 && pinch.d > 0) Module._web_zoom(pinch.d / n.d);
+      Module._web_pan((n.mx - pinch.mx) / window.innerHeight, (n.my - pinch.my) / window.innerHeight);
+      pinch = n;
+    }
+  });
+  function endPointer(e) {
+    if (!pts.has(e.pointerId)) return;
+    pts.delete(e.pointerId);
+    if (tap && !tap.moved && pts.size === 0 && performance.now() - tap.t < 450) {
+      var r = canvas.getBoundingClientRect(), sx = canvas.width / r.width, sy = canvas.height / r.height;
+      Module._web_tap((tap.x - r.left) * sx, (tap.y - r.top) * sy, (coarse ? 36 : 24) * sx);
+    }
+    tap = null;
+    pinch = pts.size === 2 ? pinchState() : null;
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('wheel', function (e) {
+    if (!ready) return;
+    e.preventDefault();
+    var dy = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);
+    Module._web_zoom(Math.exp(dy * 0.0012));
+    dismissHint();
+  }, { passive: false });
+
+  // Track the viewport (rotation, resize, browser chrome showing/hiding).
+  // Resolution governor. Frame rate is capped by the display, so headroom is
+  // invisible; the only way to learn whether a sharper image fits is to try it.
+  // So: climb one step after a few seconds of steady 60 fps, and if a step then
+  // costs frames (under 55 fps for 1.5 s, long enough to ride out a GC pause or
+  // a burst of detonations), drop back and never retry it (scaleCeiling). It only climbs
+  // while the LOD governor is at full detail (pxMin at its floor), so the two
+  // never compete for the same frame budget: city detail comes first.
+  var goodSince = 0, badSince = 0, lastChange = 0;
+  function setScale(v) {
+    v = Math.max(MIN_SCALE, Math.min(v, scaleCeiling));
+    if (Math.abs(v - scale) < 1e-3) return;
+    scale = v;
+    lastChange = performance.now();
+    goodSince = badSince = 0;
+    fit();
+  }
+  function governResolution(fps, pxMin) {
+    if (!ready || document.hidden) return;
+    var now = performance.now();
+    if (now - lastChange < 1500) return; // let a change settle before judging it
+    if (fps < 55) {
+      goodSince = 0;
+      if (!badSince) badSince = now;
+      if (now - badSince > 1500 && scale > MIN_SCALE) {
+        scaleCeiling = Math.max(MIN_SCALE, scale - STEP); // this level is too heavy
+        setScale(scale - STEP);
+      }
+    } else if (fps >= 57 && pxMin <= 1.05) {
+      badSince = 0;
+      if (!goodSince) goodSince = now;
+      if (now - goodSince > 3000 && scale < scaleCeiling) setScale(scale + STEP);
+    } else {
+      goodSince = badSince = 0;
+    }
+  }
+
+  function fit() {
+    if (ready) Module._web_resize(window.desiredCanvasWidth(), window.desiredCanvasHeight());
+  }
+  window.addEventListener('resize', fit);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', fit);
+
+  canvas.addEventListener('webglcontextlost', function (e) {
+    e.preventDefault();
+    showCard('Graphics context lost', 'The browser reclaimed the GPU. Reload the page to continue.', null);
+  });
+
+  // --- Emscripten module --------------------------------------------------------
+  window.Module = {
+    canvas: canvas,
+    print: function (t) { console.log(t); },
+    printErr: function (t) { console.warn(t); },
+    setStatus: function (text) {
+      var m = text && text.match(/\(([\d.]+)\/(\d+)\)/);
+      if (m) {
+        var done = +m[1], total = +m[2];
+        $('cardBarFill').style.width = (100 * done / total).toFixed(1) + '%';
+        $('cardText').textContent = 'Downloading the simulation and the 1:1 New York City map (' +
+          (done / 1048576).toFixed(1) + ' / ' + (total / 1048576).toFixed(1) + ' MB)';
+      } else if (!ready && text === '') {
+        $('cardBarFill').style.width = '100%';
+        $('cardText').textContent = 'Building the city (485,000 buildings)…';
+      }
+    },
+    onAbort: function () { window.simFailed('The simulation stopped unexpectedly. Reload to try again.'); }
+  };
+})();
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

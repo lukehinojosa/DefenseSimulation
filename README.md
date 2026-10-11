@@ -306,6 +306,77 @@ the render rate. Needs `ffmpeg` on `PATH`.
 
 ---
 
+## In-Browser Viewer (WebAssembly)
+
+The same engagement runs in any modern browser, desktop or phone, compiled to
+WebAssembly with Emscripten. It is a self-contained static page: press **Start**
+and the scenario runs in the page itself (no server-side simulation, no
+streaming), with pause, restart, 0.5x to 4x playback, and full camera control
+(drag to orbit, right-drag or two fingers to pan, scroll or pinch to zoom, E/Q
+or the on-screen arrows to rise and sink, hover a missile to ring it and tag its
+allegiance, tap a missile to follow it).
+
+### Design highlights
+
+- **One scenario, two front ends.** The raid (spawns, threat director,
+  demand-driven launches) lives in `sim::EngagementScenario`, which both
+  `defense_sim telemetry` and the web viewer step. Restart is just constructing
+  a fresh, deterministic scenario (6 ms).
+- **Single-threaded by design.** wasm threads need `SharedArrayBuffer`, which
+  needs COOP/COEP headers that static hosts such as GitHub Pages cannot send, so
+  `ThreadPool` runs `parallelFor` inline on a non-pthread wasm build. The whole
+  sim costs about 0.2 ms per 60 Hz tick in the browser.
+- **Compact map asset.** `tools/gen_web_map.py` re-encodes the 13 MB
+  `un_map.bin` at build time: quantized (at most 1.5 cm error), column-packed,
+  grouped into 1 km tiles, sorted by size within each tile, and raw-DEFLATE
+  compressed to **4.5 MB**, inflated in wasm by raylib's `DecompressData`.
+- **City renderer built for phones.** All ~485k buildings share one unit box
+  mesh, drawn instanced from a 32-byte per-instance record (centre, heading,
+  extents, class) uploaded once. Each 1 km tile is one frustum-culled instanced
+  draw. Within a tile, buildings are sorted largest first, so screen-space LOD
+  is a binary search: draw the prefix whose buildings cover at least `pxMin`
+  pixels, with the marginal ones grown in by the vertex shader instead of
+  popping.
+- **Volume-preserving far field.** Size LOD alone makes a distant city vanish
+  (each house is sub-pixel, but together they are the city). Far tiles instead
+  draw massing blocks (50 m or 125 m cells, chosen per tile by on-screen cell
+  size) that keep each cell's footprint coverage and built volume, plus the real
+  towers on top. The default 30 km view draws ~20k instances instead of 485k.
+- **Draw calls, not triangles, are the phone budget.** Each far tile's blocks
+  and towers are one contiguous record range, laid out in tile order, so
+  neighbouring far tiles merge into a single draw. Missiles are flyweights too:
+  one shared unit mesh (airframe, nose, fins, boost plume) oriented in the
+  vertex shader from a 44-byte instance record, so the whole raid is one draw.
+  Trails and line-of-sight links stream into one line batch, and detonations
+  are instanced spheres. A busy frame went from 871 draw calls to 11.
+- **Adaptive quality.** A governor raises `pxMin` (and with it the massing
+  hand-off distance) while frames run long and relaxes it as headroom returns,
+  so a phone trades distant detail for frame rate automatically. Render
+  resolution adapts the same way: it starts at 2x and climbs in 0.25x steps
+  toward the screen's native density (3x on most phones) while frames hold
+  60 fps. A step that costs frames is dropped and never retried, so it settles
+  instead of oscillating, and it only climbs once city detail is at full
+  quality.
+
+### Building and running
+
+Needs the [Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html)
+(`EMSDK` set, as `emsdk_env` does), Ninja, and Python 3.
+
+```bash
+cmake --preset wasm-release
+cmake --build --preset wasm-release
+python -m http.server 8080 --directory build/wasm-release/web
+```
+
+Then open <http://localhost:8080>. The four files in `build/wasm-release/web/`
+(`index.html`, `.js`, `.wasm`, `.data`) are the whole deployable site: copy them
+to any static host, or embed the page in another site with an `<iframe>`. The
+page must be served over HTTP; opening `index.html` from disk will not load the
+data file.
+
+---
+
 ## Building
 
 Requires CMake 3.20+, a C++17 compiler, and **Boost** (header-only
@@ -334,7 +405,8 @@ ctest --preset windows-release        # 61 tests (engine, guidance, engagement, 
 
 Presets: `windows-debug` / `windows-release` (MSVC, visualizer on),
 `linux-release` (Pi/WSL, full IPC + visualizer), `linux-headless` (no
-visualizer, for CI/servers).
+visualizer, for CI/servers), `wasm-release` (Emscripten, the in-browser viewer;
+see above).
 
 ### Linux / macOS
 

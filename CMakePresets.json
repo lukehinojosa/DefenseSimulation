@@ -44,6 +44,17 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
     },
     {
+      "name": "wasm-release",
+      "displayName": "WebAssembly Release (Emscripten) - in-browser viewer",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
       "name": "linux-headless",
       "displayName": "Linux Release (GCC) - headless, no visualizer",
       "inherits": "base",
@@ -58,7 +69,8 @@
     { "name": "windows-debug",   "configurePreset": "windows-debug" },
     { "name": "windows-release", "configurePreset": "windows-release" },
     { "name": "linux-release",   "configurePreset": "linux-release" },
-    { "name": "linux-headless",  "configurePreset": "linux-headless" }
+    { "name": "linux-headless",  "configurePreset": "linux-headless" },
+    { "name": "wasm-release",    "configurePreset": "wasm-release" }
   ],
   "testPresets": [
     { "name": "windows-debug",   "configurePreset": "windows-debug",   "configuration": "Debug" },

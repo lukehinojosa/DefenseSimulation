@@ -12,7 +12,15 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-find_package(Threads REQUIRED)
+if(EMSCRIPTEN)
+    # The browser build is single-threaded on purpose: wasm pthreads need
+    # SharedArrayBuffer, which needs COOP/COEP headers that static hosts (e.g.
+    # GitHub Pages) cannot send. ThreadPool runs parallelFor() inline there.
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fwasm-exceptions>)
+    add_link_options(-fwasm-exceptions)
+else()
+    find_package(Threads REQUIRED)
+endif()
 
 # ---------------------------------------------------------------------------
 # Core simulation library (Phase 1: math, entities, octree, engine)
@@ -22,14 +30,56 @@ add_library(sim_core
     src/SimulationEngine.cpp
     src/EngagementManager.cpp
     src/MapData.cpp
+    src/EngagementScenario.cpp
 )
 target_include_directories(sim_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(sim_core PUBLIC Threads::Threads)
+if(NOT EMSCRIPTEN)
+    target_link_libraries(sim_core PUBLIC Threads::Threads)
+endif()
 
 if(MSVC)
     target_compile_options(sim_core PRIVATE /W4)
 else()
     target_compile_options(sim_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ---------------------------------------------------------------------------
+# YAML config (yaml-cpp): prefer an installed package (vcpkg on Windows), and
+# FetchContent-build it from source otherwise (e.g. the Pi). The scenario
+# constants live in config/simulation.yaml and are loaded at runtime.
+# ---------------------------------------------------------------------------
+find_package(yaml-cpp CONFIG QUIET)
+if(NOT yaml-cpp_FOUND AND NOT TARGET yaml-cpp)
+    include(FetchContent)
+    # yaml-cpp 0.8.0 declares an ancient cmake_minimum_required that CMake 4
+    # rejects outright; this floor only affects fetched dependencies.
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        yaml-cpp
+        GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
+        GIT_TAG 0.8.0
+    )
+    FetchContent_MakeAvailable(yaml-cpp)
+    message(STATUS "yaml-cpp: built from source via FetchContent")
+else()
+    message(STATUS "yaml-cpp: using installed package")
+endif()
+# The exported target is namespaced in recent versions and bare in older ones.
+if(TARGET yaml-cpp::yaml-cpp)
+    set(SIM_YAMLCPP yaml-cpp::yaml-cpp)
+else()
+    set(SIM_YAMLCPP yaml-cpp)
+endif()
+
+# ---------------------------------------------------------------------------
+# WebAssembly build (Emscripten): the scenario + an in-browser 3D viewer. None
+# of the native transports (shared memory, UDP), tools, or tests apply there.
+# ---------------------------------------------------------------------------
+if(EMSCRIPTEN)
+    add_subdirectory(web)
+    return()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -104,33 +154,6 @@ if(MSVC)
     target_compile_options(sim_ipc PRIVATE /W4 /wd4324)
 else()
     target_compile_options(sim_ipc PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# ---------------------------------------------------------------------------
-# YAML config (yaml-cpp): prefer an installed package (vcpkg on Windows), and
-# FetchContent-build it from source otherwise (e.g. the Pi). The scenario
-# constants live in config/simulation.yaml and are loaded at runtime.
-# ---------------------------------------------------------------------------
-find_package(yaml-cpp CONFIG QUIET)
-if(NOT yaml-cpp_FOUND AND NOT TARGET yaml-cpp)
-    include(FetchContent)
-    set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-    FetchContent_Declare(
-        yaml-cpp
-        GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
-        GIT_TAG 0.8.0
-    )
-    FetchContent_MakeAvailable(yaml-cpp)
-    message(STATUS "yaml-cpp: built from source via FetchContent")
-else()
-    message(STATUS "yaml-cpp: using installed package")
-endif()
-# The exported target is namespaced in recent versions and bare in older ones.
-if(TARGET yaml-cpp::yaml-cpp)
-    set(SIM_YAMLCPP yaml-cpp::yaml-cpp)
-else()
-    set(SIM_YAMLCPP yaml-cpp)
 endif()
 
 # ---------------------------------------------------------------------------
